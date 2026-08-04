@@ -37,8 +37,8 @@ def ensure_csrf_token() -> str:
 
 
 def csrf_protect() -> None:
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path.startswith("/api/"):
-        supplied = request.headers.get("X-CSRF-Token", "")
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        supplied = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
         expected = session.get("csrf_token", "")
         if not expected or not hmac.compare_digest(supplied, expected):
             abort(403, description="Missing or invalid CSRF token")

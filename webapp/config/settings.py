@@ -40,10 +40,14 @@ class Settings:
 
 def load_settings(*, require_password: bool = False) -> Settings:
     data_dir = Path(os.environ.get("WEBAPP_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
+    if not data_dir.is_relative_to(PROJECT_ROOT):
+        raise RuntimeError("WEBAPP_DATA_DIR must be inside the project for fixed Docker mounts")
     password = os.environ.get("WEBAPP_PASSWORD")
     if require_password and not password:
         raise RuntimeError("WEBAPP_PASSWORD must be set before starting the web server")
     reserve_gib = float(os.environ.get("WEBAPP_FREE_SPACE_RESERVE_GIB", "100"))
+    if reserve_gib < 0:
+        raise RuntimeError("WEBAPP_FREE_SPACE_RESERVE_GIB cannot be negative")
     return Settings(
         project_root=PROJECT_ROOT,
         data_dir=data_dir,

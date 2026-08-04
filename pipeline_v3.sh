@@ -28,6 +28,7 @@ OVERLAP=${SEEDVR2_OVERLAP:-4}
 FORCE=${FORCE:-0}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
+FREE_SPACE_RESERVE_BYTES=${PIPELINE_FREE_SPACE_RESERVE_BYTES:-0}
 
 case "$IN" in
   /*) INPUT=$IN ;;
@@ -55,6 +56,10 @@ if [[ -n "$CONTROL_FILE" ]]; then
     "$PROJ"/*) ;;
     *) echo "PIPELINE_CONTROL_FILE must be inside the project" >&2; exit 2 ;;
   esac
+fi
+if [[ ! "$FREE_SPACE_RESERVE_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "PIPELINE_FREE_SPACE_RESERVE_BYTES must be a non-negative integer" >&2
+  exit 2
 fi
 
 if [[ ! -f "$INPUT" ]]; then
@@ -101,6 +106,16 @@ check_cancel() {
   fi
 }
 
+check_free_space() {
+  local stage=$1 available
+  available=$(df --output=avail -B1 "$WORK_ROOT" | tail -n 1 | tr -d ' ')
+  if (( available < FREE_SPACE_RESERVE_BYTES )); then
+    emit_event "safeguard_failed" "$stage"
+    echo "Free-space reserve would be crossed before stage $stage" >&2
+    exit 76
+  fi
+}
+
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "[build] $IMAGE"
   docker build -t "$IMAGE" "$PROJ/docker/seedvr2"
@@ -112,6 +127,7 @@ if [[ "$FORCE" == 1 ]]; then
 fi
 
 check_cancel "prepare_50p"
+check_free_space "prepare_50p"
 emit_event "stage_start" "prepare_50p"
 if [[ ! -s "$DEINTERLACED" ]]; then
   echo "[1/4] BFF PAL -> square-pixel 768x576 50p FFV1"
@@ -133,6 +149,7 @@ fi
 emit_event "stage_complete" "prepare_50p"
 check_cancel "prepare_50p"
 
+check_free_space "baseline_encode"
 emit_event "stage_start" "baseline_encode"
 if [[ ! -s "$BASELINE" ]]; then
   echo "[2/4] faithful 1440p50 comparison encode"
@@ -153,6 +170,7 @@ fi
 emit_event "stage_complete" "baseline_encode"
 check_cancel "baseline_encode"
 
+check_free_space "seedvr2_restore"
 emit_event "stage_start" "seedvr2_restore"
 if [[ ! -s "$RESTORED" ]]; then
   echo "[3/4] SeedVR2 temporal restoration ($MODEL, ${RESOLUTION}px short side)"
@@ -186,6 +204,7 @@ fi
 emit_event "stage_complete" "seedvr2_restore"
 check_cancel "seedvr2_restore"
 
+check_free_space "audio_mux"
 emit_event "stage_start" "audio_mux"
 if [[ ! -s "$OUTPUT" ]]; then
   echo "[4/4] mux restored video with sample-accurate archival FLAC audio"

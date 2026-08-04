@@ -21,6 +21,9 @@ from webapp.server.services import append_event
 
 PIPELINE_PREFIX = "PIPELINE_EVENT "
 PROGRESS_RE = re.compile(r"frame=\s*(\d+).*?fps=\s*([0-9.]+)")
+WRITTEN_RE = re.compile(r"Written\s+(\d+)/(\d+)\s+frames")
+CHUNK_RE = re.compile(r"Chunk\s+(\d+)/(\d+):")
+STREAM_COMPLETE_RE = re.compile(r"Streaming complete:\s+(\d+)\s+frames")
 ACTIVE_STATES = ("preparing", "running", "assembling", "cancel_requested")
 
 
@@ -227,6 +230,7 @@ def _run_pipeline(settings: Settings, job) -> int:
     environment.update(
         PIPELINE_WORK_ROOT=str(settings.data_dir / "restoration_work"),
         PIPELINE_CONTROL_FILE=str(control),
+        PIPELINE_FREE_SPACE_RESERVE_BYTES=str(settings.free_space_reserve_bytes),
         SEEDVR2_MODEL=str(snapshot["model"]),
         SEEDVR2_RESOLUTION=str(snapshot["resolution"]),
         SEEDVR2_BATCH=str(snapshot["batch"]),
@@ -238,6 +242,8 @@ def _run_pipeline(settings: Settings, job) -> int:
     last_progress = 0.0
     last_metrics = 0.0
     current_stage: str | None = "worker_checks"
+    current_chunk = 1
+    restore_started: float | None = None
     with log_partial.open("a", encoding="utf-8", buffering=1) as log_handle:
         log_handle.write(f"[{utc_now()}] worker command: pipeline_v3.sh <registered-source> {start:.3f} {duration:.3f} <generated-output> {job['public_id']}\n")
         process = subprocess.Popen(
@@ -266,13 +272,28 @@ def _run_pipeline(settings: Settings, job) -> int:
                     try:
                         event = json.loads(clean.removeprefix(PIPELINE_PREFIX))
                         current_stage = event.get("stage", current_stage)
+                        if event.get("type") == "stage_start" and current_stage == "seedvr2_restore":
+                            restore_started = time.monotonic()
                         _pipeline_event(settings, job["id"], event, started)
                     except json.JSONDecodeError:
                         pass
                 else:
+                    chunk_match = CHUNK_RE.search(clean)
+                    if chunk_match:
+                        current_chunk = int(chunk_match.group(1))
+                    written_match = WRITTEN_RE.search(clean)
+                    complete_match = STREAM_COMPLETE_RE.search(clean)
                     match = PROGRESS_RE.search(clean)
                     now_mono = time.monotonic()
-                    if match and now_mono - last_progress >= 2:
+                    if (written_match or complete_match) and restore_started is not None:
+                        if complete_match:
+                            restored_frames = int(complete_match.group(1))
+                        else:
+                            restored_frames = (current_chunk - 1) * int(snapshot["chunk"]) + int(written_match.group(1))
+                        measured_fps = restored_frames / max(0.001, now_mono - restore_started)
+                        _progress_update(settings, job["id"], current_stage, restored_frames, measured_fps, started)
+                        last_progress = now_mono
+                    elif match and now_mono - last_progress >= 2:
                         _progress_update(settings, job["id"], current_stage, int(match.group(1)), float(match.group(2)), started)
                         last_progress = now_mono
                     elif clean and not clean.startswith("frame="):
@@ -281,8 +302,18 @@ def _run_pipeline(settings: Settings, job) -> int:
             now_mono = time.monotonic()
             if now_mono - last_metrics >= 15:
                 metrics = _system_metrics(settings)
-                with connect(settings.database_path) as db:
-                    append_event(db, job["id"], "metrics", state=_job_state(settings, job["id"]), stage=current_stage, payload=metrics)
+                with connect(settings.database_path) as db, transaction(db):
+                    current = db.execute("SELECT state, eta_seconds FROM jobs WHERE id=?", (job["id"],)).fetchone()
+                    elapsed = time.monotonic() - started
+                    eta = max(0, (current["eta_seconds"] or 0) - 15) if current else None
+                    db.execute(
+                        "UPDATE jobs SET elapsed_seconds=?, eta_seconds=?, updated_at=? WHERE id=?",
+                        (elapsed, eta, utc_now(), job["id"]),
+                    )
+                    append_event(
+                        db, job["id"], "metrics", state=current["state"] if current else None,
+                        stage=current_stage, payload=metrics,
+                    )
                 last_metrics = now_mono
         for line in process.stdout:
             log_handle.write(line)
@@ -344,6 +375,13 @@ def _validate_and_complete(settings: Settings, job) -> None:
         raise WorkerError(f"Output duration validation failed: expected {expected_duration:.3f}s, found {actual_duration:.3f}s")
     if not video or video.get("codec_name") != "hevc" or video.get("pix_fmt") != "yuv420p10le":
         raise WorkerError("Output video validation failed: expected 10-bit HEVC")
+    if (
+        video.get("color_range") != "tv"
+        or video.get("color_space") != "bt709"
+        or video.get("color_transfer") != "bt709"
+        or video.get("color_primaries") != "bt709"
+    ):
+        raise WorkerError("Output colour validation failed: expected limited-range BT.709 tags")
     if not audio or audio.get("codec_name") != "flac" or int(audio.get("sample_rate", 0)) != 48000:
         raise WorkerError("Output audio validation failed: expected 48 kHz FLAC")
     expected_frames = job["frames_total"]
@@ -355,7 +393,18 @@ def _validate_and_complete(settings: Settings, job) -> None:
     with connect(settings.database_path) as db, transaction(db):
         _register_file(settings, db, job["id"], "restored_output", output, "video/x-matroska", media, round(actual_duration * 1000), actual_frames)
         if baseline.is_file():
-            _register_file(settings, db, job["id"], "baseline", baseline, "video/x-matroska", {}, round(actual_duration * 1000), actual_frames)
+            baseline_media = _probe_output(settings, baseline)
+            baseline_video = next(
+                (item for item in baseline_media.get("streams", []) if item.get("codec_type") == "video"), None
+            )
+            baseline_duration = float(baseline_media.get("format", {}).get("duration", 0))
+            baseline_frames = int((baseline_video or {}).get("nb_read_frames") or 0)
+            if abs(baseline_duration - expected_duration) > 0.12 or baseline_frames != expected_frames:
+                raise WorkerError("Baseline validation failed: duration or frame count mismatch")
+            _register_file(
+                settings, db, job["id"], "baseline", baseline, "video/x-matroska",
+                baseline_media, round(baseline_duration * 1000), baseline_frames,
+            )
         if log.is_file():
             _register_file(settings, db, job["id"], "pipeline_log", log, "text/plain", {}, None, None)
         now = utc_now()

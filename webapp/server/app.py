@@ -73,6 +73,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.errorhandler(404)
     @app.errorhandler(409)
     @app.errorhandler(413)
+    @app.errorhandler(429)
     def expected_error(error):
         if request.path.startswith("/api/"):
             return jsonify({"error": error.description, "status": error.code}), error.code

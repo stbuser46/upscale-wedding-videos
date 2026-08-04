@@ -1,79 +1,49 @@
 # Wedding DVD restoration
 
-## Documentation
+This repository preserves and selectively restores two PAL wedding DVDs. The
+archival ISOs remain the source of truth; AI output is a cleaner presentation,
+not a factual recovery of detail that was never recorded.
 
-- [`docs/CURRENT_PIPELINE.md`](docs/CURRENT_PIPELINE.md) records the source
-  analysis, older experiments, final SeedVR2 design, local patches, benchmark,
-  output inventory and operational rules.
-- [`docs/WEB_UI_SPEC.md`](docs/WEB_UI_SPEC.md) is the specification and phased
-  implementation plan for DVD chapter discovery, prioritization, custom time
-  slices, queued restoration, cooperative pause/resume, progress/ETA and secure
-  remote access.
+## Current entry points
 
-The next phase is chapter-first. We will scan both original ISOs, review and
-prioritize their titles/chapters, and restore selected chapters or time slices.
-An automatic complete-disc run is not currently planned.
+- [`pipeline_v3.sh`](pipeline_v3.sh) is the proven quality-first 50p SeedVR2
+  restoration pipeline.
+- [`webapp/`](webapp/) is the private chapter catalog and durable restoration
+  queue. Phase 1 and Phase 2 are implemented; see its
+  [setup and operations guide](webapp/README.md).
+- [`docs/CURRENT_PIPELINE.md`](docs/CURRENT_PIPELINE.md) records media analysis,
+  pinned settings, validation, performance, and known pipeline limitations.
+- [`docs/WEB_UI_SPEC.md`](docs/WEB_UI_SPEC.md) is the authoritative product and
+  data-model specification.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) maps implemented phases to the
+  current code and states what remains.
 
-The quality-first pipeline is `pipeline_v3.sh`. It preserves both temporal
-samples from the bottom-field-first PAL DVD (50p), performs restoration with a
-video-native SeedVR2 model, and decodes the source AC-3 once into lossless FLAC
-for sample-accurate trimming without another lossy audio encode.
+## Repository layout
 
-It also creates a non-AI 1440p50 baseline beside each job. Always compare the
-baseline and restored clips **in motion** before committing to a full disc.
+| Path | Contents |
+| --- | --- |
+| `source/` | Irreplaceable original ISO images. Read-only inputs; gitignored. |
+| `pipeline_v3.sh` | Production restoration stages and host-worker control seam. |
+| `docker/` | Pinned CUDA/model images and local upstream patches. |
+| `models/` | Downloaded model weights; gitignored. |
+| `webapp/` | New scanner, SQLite catalog, authenticated API/UI, and GPU worker. |
+| `webapp/data/` | All new generated catalog/media/job runtime state; gitignored. |
+| `webui/` | Historical blind comparison/voting app on port 8092; unchanged. |
+| `docs/` | Current pipeline, UI specification, and implemented architecture. |
+| `work/`, `out/` | Legacy pipeline intermediates and reference outputs; never managed by the new app. |
 
-## Midpoint quality test
+Do not modify, move, or delete files in `source/`, existing `work/`, or `out/`.
+The new application mounts source ISOs read-only and keeps its generated files
+under `webapp/data/`.
 
-The source is 3:13:02 long. This test covers 1:36:12–1:36:30, a continuous
-mid-film zoom from a group shot into close faces:
+## Restoration profile
 
-```bash
-./pipeline_v3.sh work/dvd1_title.vob 5772 18 \
-  out/DVD1_midpoint_18s_seedvr2.mkv midpoint_v3
-```
+The v3 pipeline preserves both bottom-field-first PAL motion samples as 50p,
+creates a non-AI 1440p50 baseline, restores temporally with the SeedVR2 3B FP16
+model, and muxes sample-accurately trimmed 48 kHz FLAC audio. Its verified
+18-second reference is documented in `docs/CURRENT_PIPELINE.md`.
 
-The first run builds the CUDA image and downloads the pinned model. Later runs
-reuse both. Work stages are resumable; set `FORCE=1` only when intentionally
-regenerating a tag.
-
-### Completed reference render
-
-The 1:36:12 midpoint test has been rendered and verified:
-
-- `out/DVD1_midpoint_18s_seedvr2.mkv` — full 1920x1440 restoration
-- `out/DVD1_midpoint_18s_comparison.mkv` — labelled side-by-side motion check
-- exactly 18.000 seconds / 900 frames / 50 fps
-- 10-bit BT.709 HEVC video and 48 kHz stereo 16-bit FLAC audio
-- 21m11s of SeedVR2 processing at 0.71 fps; peak VRAM was 56 GB
-
-The source contains one recoverable damaged AC-3 packet in this interval. The
-pipeline decodes with a five-second pre-roll, recovers, and produces a complete
-18-second FLAC track.
-
-## Quality controls
-
-Defaults favor quality on the 96 GB RTX PRO 6000:
-
-- SeedVR2 3B FP16
-- 1920x1440 output at 50 fps
-- 129-frame temporal batches with four-frame overlap
-- tiled VAE encode/decode
-- 10-bit HEVC intermediate and sample-accurate archival FLAC audio
-- five-second audio decode pre-roll to avoid partial AC-3 packets on DVD seeks
-
-Environment overrides are available for experiments:
-
-```bash
-SEEDVR2_MODEL=seedvr2_ema_7b_fp16.safetensors \
-SEEDVR2_BATCH=129 SEEDVR2_RESOLUTION=1440 \
-./pipeline_v3.sh input.vob START DURATION output.mkv unique_tag
-```
-
-For a long job, use a new tag so previous tests remain intact and resumable.
-At the measured speed, the 3:13:02 first disc would take roughly 9.5 days of
-continuous GPU time; chapter and slice selection avoids spending that time on
-low-priority material.
-
-Keep the original DVD rip permanently. AI restoration can create a cleaner,
-more plausible presentation, but it cannot recover factual detail that the DVD
-never recorded; the original remains the archival source of truth.
+The web application is chapter-first: inspect both discs, prioritize meaningful
+sections, and queue a DVD chapter or exact title-relative time slice. One host
+worker owns the GPU. In the current Phase 2 implementation, cancellation is
+honored only between major pipeline stages and pause/resume is not offered.

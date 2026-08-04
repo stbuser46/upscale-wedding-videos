@@ -450,6 +450,13 @@ def retry_job(public_id: str):
         job = _get_job_for_update(db, public_id)
         if job["state"] not in {"failed", "cancelled", "interrupted"}:
             abort(409, description=f"Job cannot be retried from {job['state']}")
+        active = db.execute(
+            """SELECT public_id FROM jobs WHERE target_type=? AND target_id=? AND id!=?
+               AND state NOT IN ('completed', 'failed', 'cancelled')""",
+            (job["target_type"], job["target_id"], job["id"]),
+        ).fetchone()
+        if active is not None:
+            abort(409, description=f"Target already has active job {active['public_id']}")
         db.execute(
             """UPDATE jobs SET state='queued', start_requested=0, stage=NULL, error=NULL,
                frames_done=0, fps=NULL, eta_seconds=NULL, completed_at=NULL, updated_at=? WHERE id=?""",
