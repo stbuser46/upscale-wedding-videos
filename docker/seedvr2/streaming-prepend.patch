@@ -1,0 +1,16 @@
+diff --git a/inference_cli.py b/inference_cli.py
+--- a/inference_cli.py
++++ b/inference_cli.py
+@@ -700,6 +700,12 @@ def _stream_video_chunks(
+             debug=debug,
+             runner_cache=runner_cache
+         )
++
++        # _process_frames_core pads the first chunk with prepend_frames, but
++        # the single-GPU streaming path did not remove those warm-up frames.
++        if chunk_idx == 1 and chunk_args.prepend_frames > 0:
++            debug.log(f"Removing {chunk_args.prepend_frames} prepended frames from first streaming chunk", category="video", force=True)
++            result = result[chunk_args.prepend_frames:]
+         
+         # Remove context frames from output
+         if context_count > 0:

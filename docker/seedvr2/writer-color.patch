@@ -1,0 +1,14 @@
+diff --git a/inference_cli.py b/inference_cli.py
+--- a/inference_cli.py
++++ b/inference_cli.py
+@@ -169,6 +169,9 @@ class FFMPEGVideoWriter:
+         self.proc = subprocess.Popen(
+             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
++             '-vf', f'scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format={pix_fmt}',
++             '-c:v', codec, '-preset', 'medium', '-crf', '12',
++             '-colorspace', 'bt709', '-color_primaries', 'bt709',
++             '-color_trc', 'bt709', '-color_range', 'tv', path],
+             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+         )

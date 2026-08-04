@@ -1,0 +1,24 @@
+# Large media & working artefacts — never in git
+source/
+work/
+out/
+models/
+webui/data/assets/
+*.ISO
+*.vob
+*.VOB
+*.mkv
+*.mp4
+*.flac
+
+# Runtime
+*.log
+*.partial
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Wedding Upscale — pick the best</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header id="top">
+    <div class="wrap">
+      <h1 id="site-title">Wedding Upscale</h1>
+      <p id="site-note" class="muted"></p>
+    </div>
+  </header>
+  <main id="app" class="wrap"><p class="muted">Loading…</p></main>
+
+  <!-- Fullscreen zoom/pan lightbox -->
+  <div id="lightbox" class="lb hidden">
+    <div class="lb-bar">
+      <span id="lb-label"></span>
+      <span class="lb-hint">click image: fit ⇄ 100% · drag to pan · Esc to close</span>
+      <button id="lb-close" class="btn ghost">✕ close</button>
+    </div>
+    <div id="lb-stage" class="lb-stage">
+      <img id="lb-img" alt="" />
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

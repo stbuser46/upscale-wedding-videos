@@ -1,0 +1,27 @@
+{
+  "title": "Wedding Upscale — pick the best-looking output",
+  "note": "For each set, compare the variants and pick which looks best. Variants are shown blind (A/B/C…); the real model is revealed after you choose. Your picks are logged for Claude to read.",
+  "sets": [
+    {
+      "id": "face_closeup",
+      "title": "Guest's face — close-up (judge sharpness vs. blur on eyes/teeth/skin)",
+      "kind": "image",
+      "variants": [
+        { "key": "original",   "label": "Original (no AI, naive upscale)", "file": "assets/face_closeup/original.png" },
+        { "key": "general_v3", "label": "Real-ESRGAN general-x4v3",        "file": "assets/face_closeup/general_v3.png" },
+        { "key": "x4plus",     "label": "Real-ESRGAN x4plus",              "file": "assets/face_closeup/x4plus.png" },
+        { "key": "codeformer", "label": "general-v3 + CodeFormer faces",   "file": "assets/face_closeup/codeformer.png" },
+        { "key": "supir",      "label": "SUPIR (diffusion)",               "file": "assets/face_closeup/supir.png" }
+      ]
+    },
+    {
+      "id": "henna_texture",
+      "title": "Henna & bangles — fine texture detail",
+      "kind": "image",
+      "variants": [
+        { "key": "original",   "label": "Original (no AI, naive upscale)", "file": "assets/henna_texture/original.png" },
+        { "key": "general_v3", "label": "Real-ESRGAN general-x4v3",        "file": "assets/henna_texture/general_v3.png" }
+      ]
+    }
+  ]
+}
