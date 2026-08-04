@@ -10,6 +10,7 @@ from webapp.config import Settings, load_settings
 from webapp.db import connect, migrate
 from webapp.server.api import api
 from webapp.server.auth import csrf_protect, ensure_csrf_token, login_rate_limited, password_matches
+from webapp.server.metrics import start_sampler
 
 
 def _secret_key(settings: Settings) -> str:
@@ -43,6 +44,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         MAX_CONTENT_LENGTH=64 * 1024,
     )
     app.register_blueprint(api)
+    start_sampler(settings)
 
     @app.before_request
     def security_gate():

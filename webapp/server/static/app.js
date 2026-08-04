@@ -204,8 +204,146 @@ async function loadJob() {
   } catch (error) { notify(error.message, true); }
 }
 
+// ---- System load graph (queue page) ----
+const METRIC_SERIES = [
+  {key: "gpu_pct", label: "GPU", color: "#1baf7a"},
+  {key: "cpu_pct", label: "CPU", color: "#2a78d6"},
+];
+let metricsMinutes = 60;
+let metricsSamples = [];
+
+function drawMetricsChart() {
+  const canvas = document.getElementById("metrics-chart");
+  if (!canvas) return;
+  const wrap = canvas.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  const width = wrap.clientWidth, height = 220;
+  canvas.width = width * dpr; canvas.height = height * dpr;
+  canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, width, height);
+  const pad = {top: 12, right: 52, bottom: 24, left: 12};
+  const plotW = width - pad.left - pad.right, plotH = height - pad.top - pad.bottom;
+  const ink = "#24201d", muted = "#746d66", line = "#ded7cc";
+  ctx.font = "11px Inter, sans-serif";
+  for (const value of [0, 25, 50, 75, 100]) {
+    const y = pad.top + plotH * (1 - value / 100);
+    ctx.strokeStyle = line; ctx.lineWidth = value === 0 ? 1 : 0.5;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+    ctx.fillStyle = muted; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(`${value}%`, pad.left + plotW + 8, y);
+  }
+  if (metricsSamples.length < 2) {
+    ctx.fillStyle = muted; ctx.textAlign = "center";
+    ctx.fillText("Collecting samples…", width / 2, height / 2);
+    return;
+  }
+  const first = Date.parse(metricsSamples[0].ts), last = Date.parse(metricsSamples.at(-1).ts);
+  const spanX = Math.max(1, last - first);
+  const xFor = ts => pad.left + plotW * ((Date.parse(ts) - first) / spanX);
+  const yFor = value => pad.top + plotH * (1 - Math.min(100, value) / 100);
+  ctx.fillStyle = muted; ctx.textBaseline = "top";
+  ctx.textAlign = "left"; ctx.fillText(new Date(first).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}), pad.left, pad.top + plotH + 8);
+  ctx.textAlign = "right"; ctx.fillText(new Date(last).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}), pad.left + plotW, pad.top + plotH + 8);
+  for (const series of METRIC_SERIES) {
+    ctx.strokeStyle = series.color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    let started = false;
+    for (const sample of metricsSamples) {
+      const value = sample[series.key];
+      if (value === null || value === undefined) { started = false; continue; }
+      const x = xFor(sample.ts), y = yFor(value);
+      if (started) ctx.lineTo(x, y); else { ctx.moveTo(x, y); started = true; }
+    }
+    ctx.stroke();
+    const lastSample = [...metricsSamples].reverse().find(sample => sample[series.key] !== null && sample[series.key] !== undefined);
+    if (lastSample) {
+      const x = xFor(lastSample.ts), y = yFor(lastSample[series.key]);
+      ctx.fillStyle = series.color; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "#fffdf9"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = ink; ctx.textAlign = "right"; ctx.textBaseline = "bottom";
+      ctx.fillText(series.label, x - 6, y - 5);
+    }
+  }
+}
+
+function metricsTiles() {
+  const root = document.getElementById("metrics-tiles");
+  const latest = metricsSamples.at(-1);
+  if (!root || !latest) return;
+  root.replaceChildren();
+  const tiles = [
+    ["GPU", latest.gpu_pct === null ? "—" : `${Math.round(latest.gpu_pct)}%`],
+    ["CPU", `${Math.round(latest.cpu_pct)}%`],
+    ["VRAM", latest.gpu_mem_mib === null ? "—" : `${(latest.gpu_mem_mib / 1024).toFixed(1)} GiB`],
+    ["GPU power", latest.gpu_power_w === null ? "—" : `${Math.round(latest.gpu_power_w)} W`],
+    ["RAM", `${Math.round(latest.mem_pct)}%`],
+  ];
+  for (const [label, value] of tiles) {
+    const cell = el("div", "metrics-tile");
+    cell.append(el("strong", "", value), el("span", "", label));
+    root.append(cell);
+  }
+}
+
+function metricsHover(event) {
+  const canvas = document.getElementById("metrics-chart");
+  const tooltip = document.getElementById("metrics-tooltip");
+  if (!canvas || !tooltip || metricsSamples.length < 2) return;
+  const rect = canvas.getBoundingClientRect();
+  const pad = {left: 12, right: 52};
+  const plotW = rect.width - pad.left - pad.right;
+  const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - pad.left) / plotW));
+  const first = Date.parse(metricsSamples[0].ts), last = Date.parse(metricsSamples.at(-1).ts);
+  const target = first + ratio * (last - first);
+  let nearest = metricsSamples[0];
+  for (const sample of metricsSamples) {
+    if (Math.abs(Date.parse(sample.ts) - target) < Math.abs(Date.parse(nearest.ts) - target)) nearest = sample;
+  }
+  const when = new Date(Date.parse(nearest.ts)).toLocaleTimeString();
+  const gpu = nearest.gpu_pct === null ? "n/a" : `${Math.round(nearest.gpu_pct)}%`;
+  const vram = nearest.gpu_mem_mib === null ? "n/a" : `${(nearest.gpu_mem_mib / 1024).toFixed(1)} GiB`;
+  tooltip.textContent = `${when} · GPU ${gpu} · CPU ${Math.round(nearest.cpu_pct)}% · VRAM ${vram}`;
+  tooltip.classList.remove("hidden");
+  tooltip.style.left = `${Math.min(rect.width - 220, Math.max(0, event.clientX - rect.left - 110))}px`;
+}
+
+let metricsLoading = false;
+async function loadMetrics() {
+  if (metricsLoading || !document.getElementById("metrics-chart")) return;
+  metricsLoading = true;
+  try {
+    const payload = await api(`/api/metrics?minutes=${metricsMinutes}`);
+    metricsSamples = payload.samples;
+    drawMetricsChart();
+    metricsTiles();
+    const updated = document.getElementById("metrics-updated");
+    if (updated) updated.textContent = `Sampled every 5 s · updated ${new Date().toLocaleTimeString()}`;
+  } catch (error) { /* metrics are auxiliary; never toast-spam the queue page */ }
+  finally { metricsLoading = false; }
+}
+
+function initMetrics() {
+  const ranges = document.getElementById("metrics-ranges");
+  if (!ranges) return;
+  ranges.addEventListener("click", event => {
+    const button = event.target.closest("button[data-minutes]");
+    if (!button) return;
+    metricsMinutes = Number(button.dataset.minutes);
+    for (const other of ranges.querySelectorAll("button")) other.classList.toggle("active", other === button);
+    loadMetrics();
+  });
+  const canvas = document.getElementById("metrics-chart");
+  canvas.addEventListener("mousemove", metricsHover);
+  canvas.addEventListener("mouseleave", () => document.getElementById("metrics-tooltip").classList.add("hidden"));
+  window.addEventListener("resize", drawMetricsChart);
+  loadMetrics();
+  window.setInterval(loadMetrics, 10000);
+}
+
 const page = document.body.dataset.page;
 if (page === "library" && document.body.dataset.titleId) loadTitle();
 else if (page === "library") loadLibrary();
 else if (page === "queue" && document.body.dataset.publicId) { loadJob(); window.setInterval(loadJob, 2000); }
-else if (page === "queue") { loadQueue(); window.setInterval(loadQueue, 2000); }
+else if (page === "queue") { loadQueue(); window.setInterval(loadQueue, 2000); initMetrics(); }

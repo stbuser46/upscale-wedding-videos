@@ -5,4 +5,25 @@
 <p>Jobs run one at a time. Cancellation is cooperative and takes effect only after the current major pipeline stage finishes.</p></div></section>
 <aside class="phase-notice"><strong>Pause is not available in Phase 2.</strong> True pause/resume needs independently durable 15-second chunks (Phase 3). Do not close the worker to simulate a pause.</aside>
 <section id="queue-list" class="queue-list" aria-live="polite"><div class="loading">Loading queue…</div></section>
+<section class="metrics-panel" aria-label="System load">
+  <div class="metrics-header">
+    <div><p class="eyebrow">System load</p><h2>GPU &amp; CPU utilisation</h2></div>
+    <div class="metrics-ranges" id="metrics-ranges" role="group" aria-label="Time range">
+      <button type="button" class="button small" data-minutes="15">15m</button>
+      <button type="button" class="button small active" data-minutes="60">1h</button>
+      <button type="button" class="button small" data-minutes="360">6h</button>
+      <button type="button" class="button small" data-minutes="1440">24h</button>
+    </div>
+  </div>
+  <div class="metrics-tiles" id="metrics-tiles"></div>
+  <div class="metrics-chart-wrap">
+    <canvas id="metrics-chart" height="220" role="img" aria-label="GPU and CPU utilisation over time"></canvas>
+    <div id="metrics-tooltip" class="metrics-tooltip hidden"></div>
+  </div>
+  <div class="metrics-legend">
+    <span class="legend-item"><span class="legend-dot gpu"></span>GPU</span>
+    <span class="legend-item"><span class="legend-dot cpu"></span>CPU</span>
+    <span class="muted metrics-updated" id="metrics-updated"></span>
+  </div>
+</section>
 {% endblock %}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -58,6 +58,45 @@ def session_info():
     from flask import session
 
     return jsonify({"csrf_token": session["csrf_token"], "phase": 2, "pause_available": False})
+
+
+@api.get("/metrics")
+def system_metrics():
+    try:
+        minutes = min(4320, max(5, int(request.args.get("minutes", 60))))
+    except ValueError:
+        abort(400, description="minutes must be an integer")
+    cutoff = datetime.now(UTC) - timedelta(minutes=minutes)
+    with _db() as db:
+        rows = db.execute(
+            "SELECT ts, cpu_pct, mem_pct, gpu_pct, gpu_mem_mib, gpu_power_w "
+            "FROM system_metrics WHERE ts >= ? ORDER BY ts",
+            (cutoff.isoformat(timespec="milliseconds"),),
+        ).fetchall()
+    max_points = 720
+    if len(rows) > max_points:
+        # Average fixed-size buckets so long ranges stay a bounded payload.
+        bucket = len(rows) / max_points
+
+        def bucket_mean(chunk, key):
+            values = [row[key] for row in chunk if row[key] is not None]
+            return round(sum(values) / len(values), 1) if values else None
+
+        sampled = []
+        for index in range(max_points):
+            chunk = rows[int(index * bucket): int((index + 1) * bucket)] or [rows[-1]]
+            sampled.append({
+                "ts": chunk[-1]["ts"],
+                "cpu_pct": bucket_mean(chunk, "cpu_pct"),
+                "mem_pct": bucket_mean(chunk, "mem_pct"),
+                "gpu_pct": bucket_mean(chunk, "gpu_pct"),
+                "gpu_mem_mib": bucket_mean(chunk, "gpu_mem_mib"),
+                "gpu_power_w": bucket_mean(chunk, "gpu_power_w"),
+            })
+        rows = sampled
+    else:
+        rows = [dict(row) for row in rows]
+    return jsonify({"minutes": minutes, "samples": rows})
 
 
 @api.get("/discs")

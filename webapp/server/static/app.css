@@ -158,3 +158,23 @@ dl dd { margin: 5px 0 0; overflow-wrap: anywhere; }
   .summary-card { grid-template-columns: 1fr; }
   .login-card { padding: 32px 25px; }
 }
+
+/* System load metrics panel (queue page) */
+.metrics-panel { margin-top: 46px; background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 30px; box-shadow: var(--shadow); }
+.metrics-header { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; flex-wrap: wrap; }
+.metrics-header h2 { font: 500 26px/1.2 Georgia, serif; margin: 4px 0 0; }
+.metrics-ranges { display: flex; gap: 8px; }
+.metrics-ranges .button.active { background: var(--wine); border-color: var(--wine); color: white; }
+.metrics-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; margin: 22px 0 18px; padding: 18px 0; border-block: 1px solid var(--line); }
+.metrics-tile strong { display: block; font: 500 23px Georgia, serif; font-variant-numeric: tabular-nums; }
+.metrics-tile span { display: block; color: var(--muted); font-size: 12px; margin-top: 5px; }
+.metrics-chart-wrap { position: relative; }
+.metrics-chart-wrap canvas { display: block; width: 100%; }
+.metrics-tooltip { position: absolute; top: -6px; background: var(--ink); color: #f8f5ef; font-size: 12px; padding: 6px 11px; border-radius: 9px; pointer-events: none; white-space: nowrap; }
+.metrics-tooltip.hidden { display: none; }
+.metrics-legend { display: flex; align-items: center; gap: 18px; margin-top: 14px; font-size: 13px; }
+.legend-item { display: inline-flex; align-items: center; gap: 7px; }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; }
+.legend-dot.gpu { background: #1baf7a; }
+.legend-dot.cpu { background: #2a78d6; }
+.metrics-updated { margin-left: auto; font-size: 12px; }
