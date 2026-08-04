@@ -4,6 +4,7 @@ work/
 out/
 models/
 webui/data/assets/
+webapp/data/
 *.ISO
 *.vob
 *.VOB
@@ -17,6 +18,7 @@ webui/data/assets/
 __pycache__/
 *.pyc
 .venv/
+webapp/.venv/
 node_modules/
 *.sqlite
 *.sqlite-wal
