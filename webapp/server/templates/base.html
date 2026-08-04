@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ session.csrf_token }}">
+  <title>{% block title %}Wedding Film Restoration{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body data-page="{{ page|default('') }}" {% block body_data %}{% endblock %}>
+  <header class="site-header">
+    <a class="brand" href="{{ url_for('library') }}">
+      <span class="brand-mark">YA</span>
+      <span><strong>Yacoob &amp; Aysha</strong><small>Film restoration archive</small></span>
+    </a>
+    <nav>
+      <a href="{{ url_for('library') }}" {% if page == 'library' %}aria-current="page"{% endif %}>Library</a>
+      <a href="{{ url_for('queue') }}" {% if page == 'queue' %}aria-current="page"{% endif %}>Restoration queue</a>
+      <form action="{{ url_for('logout') }}" method="post"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link-button">Sign out</button></form>
+    </nav>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

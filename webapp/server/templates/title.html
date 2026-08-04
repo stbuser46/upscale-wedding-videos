@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Title browser · Wedding Film Restoration{% endblock %}
+{% block body_data %}data-title-id="{{ title_id }}"{% endblock %}
+{% block content %}
+<section class="title-heading">
+  <a href="{{ url_for('library') }}" class="back-link">← Back to library</a>
+  <p class="eyebrow" id="title-kicker">DVD title</p><h1 id="title-name">Loading…</h1>
+  <p id="title-meta" class="muted"></p>
+</section>
+<section class="player-panel">
+  <div class="video-shell"><video id="chapter-player" controls preload="metadata"></video><div id="player-empty">Select a chapter to play its review proxy.</div></div>
+  <div class="now-playing"><span>Now playing</span><strong id="now-playing">No chapter selected</strong></div>
+</section>
+<section class="slice-panel">
+  <div><p class="eyebrow">Custom selection</p><h2>Create a time slice</h2><p>Times are relative to this DVD title and may cross chapter boundaries.</p></div>
+  <form id="slice-form" class="slice-form">
+    <label>In <input name="start" placeholder="00:00:00" required></label>
+    <label>Out <input name="end" placeholder="00:00:05" required></label>
+    <label>Output name <input name="name" maxlength="120" placeholder="Five-second test" required></label>
+    <label>Priority <select name="priority"><option>normal</option><option>high</option><option>low</option></select></label>
+    <label class="wide">Note <input name="note" maxlength="2000" placeholder="Why this moment matters"></label>
+    <button class="button primary" type="submit">Create &amp; queue slice</button>
+  </form>
+</section>
+<section class="chapter-section">
+  <div class="section-heading"><div><p class="eyebrow">DVD navigation</p><h2>Chapters</h2></div>
+  <button id="queue-selected" class="button primary" disabled>Queue selected <span id="selected-count">0</span></button></div>
+  <div id="chapters" class="chapter-grid"><div class="loading">Loading chapters…</div></div>
+</section>
+{% endblock %}

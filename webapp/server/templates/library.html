@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Library · Wedding Film Restoration{% endblock %}
+{% block content %}
+<section class="hero">
+  <div><p class="eyebrow">Original DVD inventory</p><h1>Choose the moments that matter.</h1>
+  <p>Browse every DVD-defined chapter, add context, and restore only the sections worth preserving in HD.</p></div>
+  <button id="rescan" class="button secondary">Re-scan both ISOs</button>
+</section>
+<section id="library" class="disc-grid" aria-live="polite"><div class="loading">Loading disc catalog…</div></section>
+{% endblock %}
