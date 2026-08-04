@@ -25,6 +25,11 @@ RESOLUTION=${SEEDVR2_RESOLUTION:-1440}
 BATCH=${SEEDVR2_BATCH:-129}
 CHUNK=${SEEDVR2_CHUNK:-750}
 OVERLAP=${SEEDVR2_OVERLAP:-4}
+# torch.compile on VAE+DiT: measured 1.28x steady-state on the RTX PRO 6000
+# with output visually approved against the uncompiled midpoint reference on
+# 2026-08-04 (PSNR 48.9 dB). Set SEEDVR2_COMPILE=0 to reproduce the exact
+# pre-compile output path.
+COMPILE=${SEEDVR2_COMPILE:-1}
 FORCE=${FORCE:-0}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
@@ -175,6 +180,10 @@ emit_event "stage_start" "seedvr2_restore"
 if [[ ! -s "$RESTORED" ]]; then
   echo "[3/4] SeedVR2 temporal restoration ($MODEL, ${RESOLUTION}px short side)"
   rm -f "$RESTORED_PART"
+  COMPILE_ARGS=()
+  if [[ "$COMPILE" == 1 ]]; then
+    COMPILE_ARGS=(--compile_dit --compile_vae)
+  fi
   set +e
   docker run --rm --gpus all --ipc=host \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
@@ -190,7 +199,8 @@ if [[ ! -s "$RESTORED" ]]; then
     --chunk_size "$CHUNK" --temporal_overlap "$OVERLAP" --prepend_frames 4 \
     --color_correction lab \
     --vae_encode_tiled --vae_decode_tiled \
-    --video_backend ffmpeg --10bit --debug 2>&1 | tee "$LOG"
+    --video_backend ffmpeg --10bit --debug \
+    ${COMPILE_ARGS[@]+"${COMPILE_ARGS[@]}"} 2>&1 | tee "$LOG"
   seedvr_status=${PIPESTATUS[0]}
   set -e
   if (( seedvr_status != 0 )); then

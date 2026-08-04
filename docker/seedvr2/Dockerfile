@@ -31,4 +31,8 @@ RUN git apply /tmp/writer-color.patch \
     && git apply /tmp/streaming-prepend.patch \
     && rm /tmp/writer-color.patch /tmp/streaming-prepend.patch
 
+# torch.compile (Inductor) requires a host C compiler at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 ENTRYPOINT ["python", "/opt/SeedVR2/inference_cli.py"]
