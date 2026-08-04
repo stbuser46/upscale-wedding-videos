@@ -25,11 +25,12 @@ RESOLUTION=${SEEDVR2_RESOLUTION:-1440}
 BATCH=${SEEDVR2_BATCH:-129}
 CHUNK=${SEEDVR2_CHUNK:-750}
 OVERLAP=${SEEDVR2_OVERLAP:-4}
-# torch.compile on VAE+DiT: measured 1.28x steady-state on the RTX PRO 6000
-# with output visually approved against the uncompiled midpoint reference on
-# 2026-08-04 (PSNR 48.9 dB). Set SEEDVR2_COMPILE=0 to reproduce the exact
-# pre-compile output path.
-COMPILE=${SEEDVR2_COMPILE:-1}
+# torch.compile on VAE+DiT: measured 1.28x steady-state and visually approved
+# (PSNR 48.9 dB), BUT VRAM grows across streaming chunks and OOMed a
+# multi-chunk job on 2026-08-04 (93.5 GB at chunk 2+ vs 56 GB uncompiled).
+# Off by default until the accumulation is fixed; short single-chunk jobs can
+# opt in with SEEDVR2_COMPILE=1.
+COMPILE=${SEEDVR2_COMPILE:-0}
 FORCE=${FORCE:-0}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
