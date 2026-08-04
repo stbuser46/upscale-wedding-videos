@@ -102,8 +102,8 @@ function chapterCard(chapter, selectionChanged) {
     const play = el("button", "play-button", "▶"); play.type = "button"; play.ariaLabel = `Play chapter ${chapter.chapter_number}`;
     play.addEventListener("click", () => {
       const video = document.getElementById("chapter-player");
-      video.src = `/media/${chapter.proxy_artifact_id}`; video.style.display = "block";
-      document.getElementById("player-empty").style.display = "none";
+      video.src = `/media/${chapter.proxy_artifact_id}`; video.classList.add("visible");
+      document.getElementById("player-empty").classList.add("hidden");
       document.getElementById("now-playing").textContent = chapter.user_label || chapter.generated_label;
       video.play(); document.querySelector(".player-panel").scrollIntoView({behavior: "smooth", block: "center"});
     });
@@ -164,7 +164,7 @@ function queueCard(job) {
   const identity = el("div"); identity.append(el("span", `state-pill ${job.state}`, job.state.replaceAll("_"," ")));
   const heading = el("h2"); const link = el("a", "", job.display_name); link.href = `/jobs/${job.public_id}`; heading.append(link); identity.append(heading, el("div", "queue-source", `${job.disc_slug.toUpperCase()} · title ${job.title_number} · ${formatTime(job.source_start_ms)}–${formatTime(job.source_end_ms)}`));
   const stage = el("div"); stage.append(el("p", "eyebrow", "Current stage"), el("strong", "", job.stage || (job.start_requested ? "Awaiting worker" : "Not started")), el("div", "queue-source", `${job.frames_done.toLocaleString()} / ${job.frames_total.toLocaleString()} frames`));
-  const progress = el("div"); const track = el("div", "progress-track"); const fill = el("div", "progress-fill"); fill.style.width = `${Math.min(100, job.progress_percent)}%`; track.append(fill);
+  const progress = el("div"); const track = el("progress", "progress-native"); track.max = 100; track.value = Math.min(100, job.progress_percent);
   const meta = el("div", "progress-meta"); meta.append(el("span", "", `${job.progress_percent}%`), el("span", "", job.eta_seconds ? `ETA ${formatTime(job.eta_seconds * 1000)}` : "ETA pending")); progress.append(track, meta);
   const actions = el("div", "queue-actions");
   const action = (label, method, path, body, cls="button small") => { const button = el("button", cls, label); button.addEventListener("click", async () => { button.disabled = true; try { await api(path, {method, body}); await loadQueue(); } catch (error) { notify(error.message, true); button.disabled = false; } }); actions.append(button); };

@@ -67,6 +67,7 @@ main { width: min(1280px, calc(100% - 48px)); margin: 0 auto; padding: 58px 0 90
 .player-panel { display: grid; grid-template-columns: minmax(0, 1fr) 260px; background: #1d1a18; border-radius: 22px; overflow: hidden; box-shadow: var(--shadow); color: white; }
 .video-shell { position: relative; aspect-ratio: 4 / 3; max-height: 70vh; background: #12100f; display: grid; place-items: center; }
 .video-shell video { width: 100%; height: 100%; object-fit: contain; display: none; }
+.video-shell video.visible { display: block; }
 #player-empty { color: #958d86; text-align: center; padding: 30px; }
 .now-playing { padding: 35px 28px; display: flex; flex-direction: column; justify-content: flex-end; background: linear-gradient(160deg, #312723, #1d1a18); }
 .now-playing span { color: #bfb6ad; font-size: 12px; text-transform: uppercase; letter-spacing: .14em; }
@@ -106,6 +107,10 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(113,63,76,.1
 .state-pill.completed { background: #dfeadd; color: #456044; }
 .progress-track { height: 7px; border-radius: 8px; overflow: hidden; background: #e8e1d8; margin: 9px 0; }
 .progress-fill { height: 100%; background: var(--wine); }
+.progress-native { display: block; width: 100%; height: 7px; margin: 9px 0; border: 0; border-radius: 8px; overflow: hidden; appearance: none; background: #e8e1d8; }
+.progress-native::-webkit-progress-bar { background: #e8e1d8; }
+.progress-native::-webkit-progress-value { background: var(--wine); }
+.progress-native::-moz-progress-bar { background: var(--wine); }
 .progress-meta { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; }
 .queue-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; max-width: 250px; }
 .job-summary { margin: 0 0 28px; }
