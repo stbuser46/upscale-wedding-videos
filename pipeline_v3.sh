@@ -26,6 +26,8 @@ BATCH=${SEEDVR2_BATCH:-129}
 CHUNK=${SEEDVR2_CHUNK:-750}
 OVERLAP=${SEEDVR2_OVERLAP:-4}
 FORCE=${FORCE:-0}
+WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
+CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
 
 case "$IN" in
   /*) INPUT=$IN ;;
@@ -35,6 +37,25 @@ case "$OUT" in
   /*) OUTPUT=$OUT ;;
   *) OUTPUT=$PROJ/$OUT ;;
 esac
+
+case "$WORK_ROOT" in
+  "$PROJ"/*) ;;
+  *) echo "PIPELINE_WORK_ROOT must be inside the project: $WORK_ROOT" >&2; exit 2 ;;
+esac
+case "$INPUT" in
+  "$PROJ"/*) ;;
+  *) echo "Input must be inside the project: $INPUT" >&2; exit 2 ;;
+esac
+case "$OUTPUT" in
+  "$PROJ"/*) ;;
+  *) echo "Output must be inside the project: $OUTPUT" >&2; exit 2 ;;
+esac
+if [[ -n "$CONTROL_FILE" ]]; then
+  case "$CONTROL_FILE" in
+    "$PROJ"/*) ;;
+    *) echo "PIPELINE_CONTROL_FILE must be inside the project" >&2; exit 2 ;;
+  esac
+fi
 
 if [[ ! -f "$INPUT" ]]; then
   echo "Input not found: $INPUT" >&2
@@ -49,7 +70,7 @@ if (( BATCH < 1 || (BATCH - 1) % 4 != 0 )); then
   exit 2
 fi
 
-WORK=$PROJ/work/$TAG
+WORK=$WORK_ROOT/$TAG
 DEINTERLACED=$WORK/input_50p_ffv1.mkv
 RESTORED=$WORK/seedvr2_${RESOLUTION}p.mp4
 BASELINE=$WORK/baseline_1440p50.mkv
@@ -59,6 +80,26 @@ RESTORED_PART=$WORK/seedvr2_${RESOLUTION}p.partial.mp4
 BASELINE_PART=$WORK/baseline_1440p50.partial.mkv
 OUTPUT_PART=${OUTPUT%.*}.partial.${OUTPUT##*.}
 mkdir -p "$WORK" "$(dirname "$OUTPUT")" "$PROJ/models/seedvr2"
+
+PROJECT_MOUNTS=(-v "$PROJ:/proj")
+if [[ "$INPUT" == "$PROJ/source/"* ]]; then
+  # The project mount is writable for generated stages, but archival sources
+  # are overmounted read-only in every media container.
+  PROJECT_MOUNTS+=(-v "$PROJ/source:/proj/source:ro")
+fi
+
+emit_event() {
+  printf 'PIPELINE_EVENT {"type":"%s","stage":"%s"}\n' "$1" "$2"
+}
+
+check_cancel() {
+  local stage=$1
+  if [[ -n "$CONTROL_FILE" && -f "$CONTROL_FILE" ]]; then
+    emit_event "cancelled_at_boundary" "$stage"
+    echo "Cancellation honored at pipeline stage boundary: $stage"
+    exit 75
+  fi
+}
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "[build] $IMAGE"
@@ -70,11 +111,13 @@ if [[ "$FORCE" == 1 ]]; then
     "$DEINTERLACED_PART" "$RESTORED_PART" "$BASELINE_PART" "$OUTPUT_PART"
 fi
 
+check_cancel "prepare_50p"
+emit_event "stage_start" "prepare_50p"
 if [[ ! -s "$DEINTERLACED" ]]; then
   echo "[1/4] BFF PAL -> square-pixel 768x576 50p FFV1"
   rm -f "$DEINTERLACED_PART"
   docker run --rm \
-    -v "$PROJ:/proj" \
+    "${PROJECT_MOUNTS[@]}" \
     --entrypoint ffmpeg upscaler-cuda:latest \
     -hide_banner -loglevel warning -stats -y \
     -ss "$SS" -t "$DUR" -i "/proj/${INPUT#"$PROJ/"}" \
@@ -87,12 +130,15 @@ if [[ ! -s "$DEINTERLACED" ]]; then
 else
   echo "[1/4] reuse $DEINTERLACED"
 fi
+emit_event "stage_complete" "prepare_50p"
+check_cancel "prepare_50p"
 
+emit_event "stage_start" "baseline_encode"
 if [[ ! -s "$BASELINE" ]]; then
   echo "[2/4] faithful 1440p50 comparison encode"
   rm -f "$BASELINE_PART"
   docker run --rm \
-    -v "$PROJ:/proj" \
+    "${PROJECT_MOUNTS[@]}" \
     --entrypoint ffmpeg upscaler-cuda:latest \
     -hide_banner -loglevel warning -stats -y \
     -i "/proj/${DEINTERLACED#"$PROJ/"}" \
@@ -104,7 +150,10 @@ if [[ ! -s "$BASELINE" ]]; then
 else
   echo "[2/4] reuse $BASELINE"
 fi
+emit_event "stage_complete" "baseline_encode"
+check_cancel "baseline_encode"
 
+emit_event "stage_start" "seedvr2_restore"
 if [[ ! -s "$RESTORED" ]]; then
   echo "[3/4] SeedVR2 temporal restoration ($MODEL, ${RESOLUTION}px short side)"
   rm -f "$RESTORED_PART"
@@ -112,7 +161,7 @@ if [[ ! -s "$RESTORED" ]]; then
   docker run --rm --gpus all --ipc=host \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    -v "$PROJ:/proj" \
+    "${PROJECT_MOUNTS[@]}" \
     "$IMAGE" \
     "/proj/${DEINTERLACED#"$PROJ/"}" \
     --output "/proj/${RESTORED_PART#"$PROJ/"}" \
@@ -134,7 +183,10 @@ if [[ ! -s "$RESTORED" ]]; then
 else
   echo "[3/4] reuse $RESTORED"
 fi
+emit_event "stage_complete" "seedvr2_restore"
+check_cancel "seedvr2_restore"
 
+emit_event "stage_start" "audio_mux"
 if [[ ! -s "$OUTPUT" ]]; then
   echo "[4/4] mux restored video with sample-accurate archival FLAC audio"
   rm -f "$OUTPUT_PART"
@@ -147,7 +199,7 @@ if [[ ! -s "$OUTPUT" ]]; then
     }'
   )
   docker run --rm \
-    -v "$PROJ:/proj" \
+    "${PROJECT_MOUNTS[@]}" \
     --entrypoint ffmpeg upscaler-cuda:latest \
     -hide_banner -loglevel warning -stats -y \
     -i "/proj/${RESTORED#"$PROJ/"}" \
@@ -161,7 +213,10 @@ if [[ ! -s "$OUTPUT" ]]; then
 else
   echo "[4/4] reuse $OUTPUT"
 fi
+emit_event "stage_complete" "audio_mux"
+check_cancel "audio_mux"
 
+emit_event "pipeline_complete" "complete"
 echo "DONE"
 echo "  restored: $OUTPUT"
 echo "  baseline: $BASELINE"

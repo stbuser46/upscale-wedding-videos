@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Job detail · Wedding Film Restoration{% endblock %}
+{% block body_data %}data-public-id="{{ public_id }}"{% endblock %}
+{% block content %}
+<section class="title-heading"><a href="{{ url_for('queue') }}" class="back-link">← Back to queue</a><p class="eyebrow">Restoration job</p><h1 id="job-name">Loading…</h1><p id="job-source" class="muted"></p></section>
+<section id="job-summary" class="job-summary"></section>
+<section class="detail-grid">
+  <article class="panel"><p class="eyebrow">Pinned settings</p><h2>Settings snapshot</h2><dl id="job-settings"></dl></article>
+  <article class="panel"><p class="eyebrow">Structured history</p><h2>Events</h2><ol id="job-events" class="event-list"></ol></article>
+</section>
+<section id="job-artifacts" class="panel hidden"><p class="eyebrow">Validated media</p><h2>Results</h2><div id="artifact-links"></div></section>
+{% endblock %}

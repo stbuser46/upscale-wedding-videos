@@ -1,0 +1,2 @@
+{% extends "base.html" %}
+{% block content %}<section class="empty-state"><p class="eyebrow">{{ error.code }}</p><h1>{{ error.name }}</h1><p>{{ error.description }}</p><a class="button primary" href="{{ url_for('library') }}">Return to library</a></section>{% endblock %}
