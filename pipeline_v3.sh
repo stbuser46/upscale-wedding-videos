@@ -25,12 +25,16 @@ RESOLUTION=${SEEDVR2_RESOLUTION:-1440}
 BATCH=${SEEDVR2_BATCH:-129}
 CHUNK=${SEEDVR2_CHUNK:-750}
 OVERLAP=${SEEDVR2_OVERLAP:-4}
-# torch.compile on VAE+DiT: measured 1.28x steady-state and visually approved
-# (PSNR 48.9 dB), BUT VRAM grows across streaming chunks and OOMed a
-# multi-chunk job on 2026-08-04 (93.5 GB at chunk 2+ vs 56 GB uncompiled).
-# Off by default until the accumulation is fixed; short single-chunk jobs can
-# opt in with SEEDVR2_COMPILE=1.
-COMPILE=${SEEDVR2_COMPILE:-0}
+# torch.compile on the VAE ONLY (measured 1.20x steady-state, PSNR 49.0 dB
+# vs the uncompiled reference — same quality class the user approved).
+# Compiling the DiT as well is faster (1.28x) but leaks VRAM: its dynamic
+# attention-window shapes force recompilation on the differently-shaped tail
+# chunk, retaining ~27 GB and OOMing multi-chunk jobs (twice observed on
+# 2026-08-04/05; see docs/COMPILE_LEAK_INVESTIGATION.md and the flat-memory
+# acceptance run in work/compile_fix_test_20260805_025548). The VAE always
+# sees fixed 1024px tiles, so its compilation is shape-stable: 60.1 GB peak,
+# flat across chunks. SEEDVR2_COMPILE=0 restores the exact pre-compile path.
+COMPILE=${SEEDVR2_COMPILE:-1}
 FORCE=${FORCE:-0}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
@@ -183,7 +187,7 @@ if [[ ! -s "$RESTORED" ]]; then
   rm -f "$RESTORED_PART"
   COMPILE_ARGS=()
   if [[ "$COMPILE" == 1 ]]; then
-    COMPILE_ARGS=(--compile_dit --compile_vae)
+    COMPILE_ARGS=(--compile_vae --cache_vae)
   fi
   set +e
   docker run --rm --gpus all --ipc=host \
