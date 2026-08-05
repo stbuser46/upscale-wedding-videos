@@ -167,6 +167,17 @@ The complete-disc extrapolation was about 9.5 days, which is why the project is
 moving to chapter and time-slice selection instead of automatically restoring
 an entire DVD.
 
+### 2026-08-05 update: VAE-only torch.compile
+
+The pipeline now compiles the VAE by default (`--compile_vae --cache_vae`),
+measured at 1.20x steady-state (about 0.85 output fps, roughly 8 days per
+disc, ~3 hours per 3-minute chapter) with 60 GB flat peak VRAM and 49.0 dB
+PSNR against the uncompiled reference — visually approved. Compiling the DiT
+as well is faster still but recompiles on the differently-shaped tail chunk
+and leaks VRAM until multi-chunk jobs OOM; see
+`docs/COMPILE_LEAK_INVESTIGATION.md` and the acceptance tests in `scripts/`.
+`SEEDVR2_COMPILE=0` restores the original uncompiled behaviour exactly.
+
 ## Output inventory
 
 Important files in `out/`:
