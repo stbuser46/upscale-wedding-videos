@@ -36,6 +36,11 @@ OVERLAP=${SEEDVR2_OVERLAP:-4}
 # flat across chunks. SEEDVR2_COMPILE=0 restores the exact pre-compile path.
 COMPILE=${SEEDVR2_COMPILE:-1}
 FORCE=${FORCE:-0}
+# The stage-2 baseline is a non-AI 1440p50 x265 comparison encode. It is never
+# muxed into the restored output and takes ~30 CPU-minutes per chapter, during
+# which the GPU sits idle. SKIP_BASELINE=1 omits it for production fan-out runs
+# (quality of the restored result is unaffected). Default 0 keeps prior behaviour.
+SKIP_BASELINE=${SKIP_BASELINE:-0}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
 FREE_SPACE_RESERVE_BYTES=${PIPELINE_FREE_SPACE_RESERVE_BYTES:-0}
@@ -161,7 +166,9 @@ check_cancel "prepare_50p"
 
 check_free_space "baseline_encode"
 emit_event "stage_start" "baseline_encode"
-if [[ ! -s "$BASELINE" ]]; then
+if [[ "$SKIP_BASELINE" == 1 ]]; then
+  echo "[2/4] baseline comparison encode skipped (SKIP_BASELINE=1)"
+elif [[ ! -s "$BASELINE" ]]; then
   echo "[2/4] faithful 1440p50 comparison encode"
   rm -f "$BASELINE_PART"
   docker run --rm \

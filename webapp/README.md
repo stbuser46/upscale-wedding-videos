@@ -94,10 +94,30 @@ the user presses **Start**, unless `WEBAPP_AUTO_START_JOBS=1` is configured.
 | `WEBAPP_DVDTOOLS_IMAGE` | `wedding-dvdtools:latest` | Local `lsdvd`/libdvdread/MPlayer image. |
 | `WEBAPP_FREE_SPACE_RESERVE_GIB` | `100` | Worker refuses a stage when free space is below this reserve. |
 | `WEBAPP_AUTO_START_JOBS` | `0` | Start newly queued jobs automatically when set to a true value. |
+| `SKIP_BASELINE` | `0` | Set in the worker's environment to skip the CPU-only baseline encode (see below). Passed straight through to `pipeline_v3.sh`. |
 
 The bind address and port are intentionally fixed at `127.0.0.1:8093`. Put a
 private authenticated reverse proxy or Tailscale in front; do not expose the
 development server publicly.
+
+### Skipping the baseline encode for production runs
+
+Each job's stage 2 produces a non-AI comparison encode that costs ~30 CPU
+minutes and leaves the GPU idle, and it never forms part of the restored
+output. To reclaim that idle time on long fan-out runs, start the worker with
+`SKIP_BASELINE=1` in its environment — the worker forwards its environment to
+`pipeline_v3.sh`, which then jumps straight from deinterlacing to restoration.
+The restored result is byte-identical; only the throwaway comparison file is
+omitted. A worker restart is required to change this, and is cheapest to do
+while the current job is still in its restore warm-up (zero frames done).
+
+### Library and queue status
+
+The library and per-DVD pages mark which chapters are already restored (a green
+badge and a restored/total count per disc), so finished work is not accidentally
+re-queued; queueing an already-restored chapter asks for confirmation first.
+Chapters can be sorted shortest- or longest-first (each card shows an estimated
+GPU-hours cost), and the queue page can hide finished and cancelled jobs.
 
 ## Operational behavior
 

@@ -71,8 +71,13 @@ async function loadLibrary() {
       heading.append(el("span", `status ${disc.scan_status === "failed" ? "failed" : ""}`, disc.scan_status));
       header.append(heading, el("span", "disc-number", disc.slug.replace("dvd", "0")));
       const stats = el("div", "disc-stats");
-      for (const [value, label] of [[disc.title_count,"titles"],[disc.chapter_count,"chapters"],[`${disc.proxies_ready}/${disc.chapter_count}`,"proxies ready"]]) {
-        const cell = el("div"); cell.append(el("strong", "", value), el("span", "", label)); stats.append(cell);
+      for (const [value, label, cls] of [
+        [disc.title_count,"titles"],
+        [disc.chapter_count,"chapters"],
+        [`${disc.proxies_ready}/${disc.chapter_count}`,"proxies ready"],
+        [`${disc.chapters_restored}/${disc.chapter_count}`,"restored", disc.chapters_restored ? (disc.chapters_restored === disc.chapter_count ? "stat-done" : "stat-partial") : ""],
+      ]) {
+        const cell = el("div", cls || ""); cell.append(el("strong", "", value), el("span", "", label)); stats.append(cell);
       }
       const titles = el("div");
       for (const title of payload.titles) {
@@ -80,6 +85,10 @@ async function loadLibrary() {
         const link = el("a", "", `Title ${String(title.title_number).padStart(2,"0")}`); link.href = `/titles/${title.id}`;
         const left = el("div"); left.append(link, el("small", "", `${formatTime(title.duration_ms)} · ${title.chapter_count} chapters · ${title.video.aspect || "unknown aspect"}`));
         const badges = el("div");
+        if (title.chapter_count) {
+          const cls = title.chapters_restored === title.chapter_count ? "all" : title.chapters_restored ? "some" : "none";
+          badges.append(el("span", `badge restored-count ${cls}`, `${title.chapters_restored}/${title.chapter_count} restored`));
+        }
         if (title.likely_menu) badges.append(el("span", "badge", "likely menu"));
         if (title.likely_duplicate) badges.append(el("span", "badge", "possible duplicate"));
         if (title.likely_short) badges.append(el("span", "badge", "very short"));
@@ -92,7 +101,24 @@ async function loadLibrary() {
 
 function chapterCard(chapter, selectionChanged) {
   const card = el("article", "chapter-card");
+  const status = chapter.restoration || {};
+  const activeWorking = ["preparing","running","assembling","cancel_requested"].includes(status.active_state);
   const thumb = el("div", "chapter-thumb");
+  const flags = el("div", "restore-flags");
+  if (status.restored) {
+    card.classList.add("restored");
+    flags.append(el("span", "restore-flag done", "✓ Restored"));
+  }
+  if (status.active_state) {
+    card.classList.add(activeWorking ? "in-progress" : "in-queue");
+    flags.append(el("span", `restore-flag ${activeWorking ? "working" : "waiting"}`,
+      activeWorking ? `Restoring ${status.active_progress ?? 0}%` : "In queue"));
+  }
+  if (!status.restored && !status.active_state) {
+    if (status.last_state === "failed") flags.append(el("span", "restore-flag failed", "Failed"));
+    else flags.append(el("span", "restore-flag todo", "Not restored"));
+  }
+  thumb.append(flags);
   if (chapter.thumbnail_artifact_id) { const image = el("img"); image.src = `/media/${chapter.thumbnail_artifact_id}`; image.alt = ""; image.loading = "lazy"; thumb.append(image); }
   else thumb.append(el("div", "proxy-missing", "Thumbnail not generated"));
   const checkbox = el("input", "select-check"); checkbox.type = "checkbox"; checkbox.ariaLabel = `Select chapter ${chapter.chapter_number}`;
@@ -110,7 +136,9 @@ function chapterCard(chapter, selectionChanged) {
     thumb.append(play);
   }
   const content = el("div", "chapter-content");
-  const top = el("div", "chapter-topline"); top.append(el("span", "", `Chapter ${String(chapter.chapter_number).padStart(2,"0")}`), el("span", "", formatTime(chapter.duration_ms)));
+  // ~55 GPU-minutes per footage-minute on the local pipeline (VAE-compile path).
+  const gpuHours = chapter.duration_ms * 55 / 3_600_000;
+  const top = el("div", "chapter-topline"); top.append(el("span", "", `Chapter ${String(chapter.chapter_number).padStart(2,"0")}`), el("span", "", `${formatTime(chapter.duration_ms)} · ≈${gpuHours < 10 ? gpuHours.toFixed(1) : Math.round(gpuHours)}h GPU`));
   const name = el("input", "chapter-name"); name.value = chapter.user_label || chapter.generated_label; name.maxLength = 120; name.ariaLabel = "Chapter name";
   const fields = el("div", "chapter-fields");
   const priorityLabel = el("label", "", "Priority"); const select = el("select");
@@ -125,7 +153,7 @@ function chapterCard(chapter, selectionChanged) {
   }, 450); };
   name.addEventListener("change", save); select.addEventListener("change", save); notes.addEventListener("change", save);
   content.append(top, name, fields); card.append(thumb, content);
-  card.chapterId = chapter.id; card.checkbox = checkbox;
+  card.chapterId = chapter.id; card.checkbox = checkbox; card.restored = !!status.restored;
   return card;
 }
 
@@ -136,12 +164,25 @@ async function loadTitle() {
     const title = payload.title;
     document.getElementById("title-kicker").textContent = `${title.disc_slug.toUpperCase()} · DVD title ${String(title.title_number).padStart(2,"0")}`;
     document.getElementById("title-name").textContent = `${title.disc_label} — Title ${title.title_number}`;
-    document.getElementById("title-meta").textContent = `${formatTime(title.duration_ms)} · ${payload.chapters.length} chapters · ${title.video.format} ${title.video.width}×${title.video.height} · ${title.video.aspect}`;
+    const restoredCount = payload.chapters.filter(ch => ch.restoration?.restored).length;
+    document.getElementById("title-meta").textContent = `${formatTime(title.duration_ms)} · ${payload.chapters.length} chapters · ${restoredCount}/${payload.chapters.length} restored · ${title.video.format} ${title.video.width}×${title.video.height} · ${title.video.aspect}`;
     const grid = document.getElementById("chapters"); const queueButton = document.getElementById("queue-selected"); const count = document.getElementById("selected-count");
     const updateSelection = () => { const selected = [...grid.querySelectorAll(".select-check:checked")]; count.textContent = selected.length; queueButton.disabled = !selected.length; };
-    grid.replaceChildren(...payload.chapters.map(ch => chapterCard(ch, updateSelection)));
+    const sortSelect = document.getElementById("chapter-sort");
+    const renderChapters = () => {
+      const chapters = [...payload.chapters];
+      if (sortSelect.value === "shortest") chapters.sort((a, b) => a.duration_ms - b.duration_ms);
+      else if (sortSelect.value === "longest") chapters.sort((a, b) => b.duration_ms - a.duration_ms);
+      grid.replaceChildren(...chapters.map(ch => chapterCard(ch, updateSelection)));
+      updateSelection();
+    };
+    sortSelect.addEventListener("change", renderChapters);
+    renderChapters();
     queueButton.addEventListener("click", async () => {
-      const ids = [...grid.querySelectorAll(".chapter-card")].filter(card => card.checkbox.checked).map(card => card.chapterId);
+      const selected = [...grid.querySelectorAll(".chapter-card")].filter(card => card.checkbox.checked);
+      const ids = selected.map(card => card.chapterId);
+      const alreadyDone = selected.filter(card => card.restored).length;
+      if (alreadyDone && !confirm(`${alreadyDone} of the selected chapter(s) ${alreadyDone === 1 ? "is" : "are"} ALREADY RESTORED. Restoring again will redo hours of GPU work. Queue anyway?`)) return;
       try { const result = await api("/api/jobs", {method: "POST", body: {chapter_ids: ids}}); notify(`${result.created.length} chapter job(s) queued`); window.location.href = "/queue"; }
       catch (error) { notify(error.message, true); }
     });
@@ -177,11 +218,38 @@ function queueCard(job) {
   card.append(identity, stage, progress, actions); return card;
 }
 
+const QUEUE_FINISHED_STATES = new Set(["completed", "cancelled"]);
+let queueFilter = localStorage.getItem("queue-filter") || "active";
+
+function initQueueFilter() {
+  const toolbar = document.getElementById("queue-filter");
+  if (!toolbar) return;
+  const sync = () => { for (const button of toolbar.querySelectorAll("button")) button.classList.toggle("active", button.dataset.filter === queueFilter); };
+  toolbar.addEventListener("click", event => {
+    const button = event.target.closest("button[data-filter]");
+    if (!button) return;
+    queueFilter = button.dataset.filter;
+    localStorage.setItem("queue-filter", queueFilter);
+    sync(); loadQueue();
+  });
+  sync();
+}
+
 let queueLoading = false;
 async function loadQueue() {
   if (queueLoading) return; queueLoading = true;
   const root = document.getElementById("queue-list");
-  try { const jobs = await api("/api/jobs"); root.replaceChildren(...(jobs.length ? jobs.map(queueCard) : [el("div", "empty-state", "The restoration queue is empty. Choose chapters or a custom slice from the library.")])); }
+  try {
+    const jobs = await api("/api/jobs");
+    const finished = jobs.filter(job => QUEUE_FINISHED_STATES.has(job.state)).length;
+    const visible = queueFilter === "all" ? jobs : jobs.filter(job => !QUEUE_FINISHED_STATES.has(job.state));
+    const note = document.getElementById("queue-filter-note");
+    if (note) note.textContent = queueFilter === "all" || !finished ? "" : `${finished} finished job(s) hidden`;
+    const emptyMessage = jobs.length
+      ? `No active or queued jobs — ${finished} finished job(s) hidden.`
+      : "The restoration queue is empty. Choose chapters or a custom slice from the library.";
+    root.replaceChildren(...(visible.length ? visible.map(queueCard) : [el("div", "empty-state", emptyMessage)]));
+  }
   catch (error) { notify(error.message, true); }
   finally { queueLoading = false; }
 }
@@ -346,4 +414,4 @@ const page = document.body.dataset.page;
 if (page === "library" && document.body.dataset.titleId) loadTitle();
 else if (page === "library") loadLibrary();
 else if (page === "queue" && document.body.dataset.publicId) { loadJob(); window.setInterval(loadJob, 2000); }
-else if (page === "queue") { loadQueue(); window.setInterval(loadQueue, 2000); initMetrics(); }
+else if (page === "queue") { initQueueFilter(); loadQueue(); window.setInterval(loadQueue, 2000); initMetrics(); }

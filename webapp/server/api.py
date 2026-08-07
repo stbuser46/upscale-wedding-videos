@@ -106,7 +106,11 @@ def discs():
             """SELECT d.*,
                       COUNT(DISTINCT t.id) AS title_count,
                       COUNT(DISTINCT c.id) AS chapter_count,
-                      COALESCE(SUM(CASE WHEN c.proxy_state='ready' THEN 1 ELSE 0 END), 0) AS proxies_ready
+                      COALESCE(SUM(CASE WHEN c.proxy_state='ready' THEN 1 ELSE 0 END), 0) AS proxies_ready,
+                      COALESCE(SUM(CASE WHEN EXISTS(
+                          SELECT 1 FROM jobs j WHERE j.target_type='chapter'
+                          AND j.target_id=c.id AND j.state='completed'
+                      ) THEN 1 ELSE 0 END), 0) AS chapters_restored
                FROM discs d LEFT JOIN titles t ON t.disc_id=d.id
                LEFT JOIN chapters c ON c.title_id=t.id
                GROUP BY d.id ORDER BY d.id"""
@@ -128,7 +132,11 @@ def disc_titles(disc_id: int):
             abort(404, description="Disc not found")
         rows = db.execute(
             """SELECT t.*, COUNT(c.id) AS chapter_count,
-                      COALESCE(SUM(CASE WHEN c.proxy_state='ready' THEN 1 ELSE 0 END), 0) AS proxies_ready
+                      COALESCE(SUM(CASE WHEN c.proxy_state='ready' THEN 1 ELSE 0 END), 0) AS proxies_ready,
+                      COALESCE(SUM(CASE WHEN EXISTS(
+                          SELECT 1 FROM jobs j WHERE j.target_type='chapter'
+                          AND j.target_id=c.id AND j.state='completed'
+                      ) THEN 1 ELSE 0 END), 0) AS chapters_restored
                FROM titles t LEFT JOIN chapters c ON c.title_id=t.id
                WHERE t.disc_id=? GROUP BY t.id ORDER BY t.duration_ms DESC, t.title_number""",
             (disc_id,),
@@ -162,10 +170,38 @@ def title_chapters(title_id: int):
                WHERE c.title_id=? ORDER BY c.chapter_number""",
             (title_id,),
         ).fetchall()
+        job_rows = db.execute(
+            """SELECT target_id, state, public_id, frames_done, frames_total, completed_at
+               FROM jobs WHERE target_type='chapter' AND title_id=? ORDER BY id""",
+            (title_id,),
+        ).fetchall()
+    active_states = {"preparing", "running", "assembling", "cancel_requested"}
+    restoration: dict[int, dict] = {}
+    for job in job_rows:
+        info = restoration.setdefault(job["target_id"], {
+            "restored": False, "restored_job": None, "restored_at": None,
+            "active_state": None, "active_job": None, "active_progress": None,
+            "last_state": None,
+        })
+        info["last_state"] = job["state"]
+        if job["state"] == "completed":
+            info["restored"] = True
+            info["restored_job"] = job["public_id"]
+            info["restored_at"] = job["completed_at"]
+        elif job["state"] == "queued" or job["state"] in active_states:
+            info["active_state"] = job["state"]
+            info["active_job"] = job["public_id"]
+            if job["frames_total"]:
+                info["active_progress"] = round(job["frames_done"] * 100 / job["frames_total"])
     title_item = dict(title)
     for key in ("video_json", "audio_json", "subtitles_json", "raw_navigation_json"):
         title_item[key.removesuffix("_json")] = json.loads(title_item.pop(key))
-    return jsonify({"title": title_item, "chapters": [dict(row) for row in rows]})
+    chapters = []
+    for row in rows:
+        item = dict(row)
+        item["restoration"] = restoration.get(item["id"])
+        chapters.append(item)
+    return jsonify({"title": title_item, "chapters": chapters})
 
 
 @api.get("/titles/<int:title_id>/proxy")

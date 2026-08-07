@@ -24,7 +24,16 @@
 </section>
 <section class="chapter-section">
   <div class="section-heading"><div><p class="eyebrow">DVD navigation</p><h2>Chapters</h2></div>
-  <button id="queue-selected" class="button primary" disabled>Queue selected <span id="selected-count">0</span></button></div>
+  <div class="section-tools">
+    <label class="chapter-sort-label">Sort
+      <select id="chapter-sort">
+        <option value="dvd">DVD order</option>
+        <option value="shortest">Shortest first</option>
+        <option value="longest">Longest first</option>
+      </select>
+    </label>
+    <button id="queue-selected" class="button primary" disabled>Queue selected <span id="selected-count">0</span></button>
+  </div></div>
   <div id="chapters" class="chapter-grid"><div class="loading">Loading chapters…</div></div>
 </section>
 {% endblock %}

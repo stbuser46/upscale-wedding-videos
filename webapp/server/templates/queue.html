@@ -4,6 +4,11 @@
 <section class="hero compact"><div><p class="eyebrow">One GPU · durable queue</p><h1>Restoration queue</h1>
 <p>Jobs run one at a time. Cancellation is cooperative and takes effect only after the current major pipeline stage finishes.</p></div></section>
 <aside class="phase-notice"><strong>Pause is not available in Phase 2.</strong> True pause/resume needs independently durable 15-second chunks (Phase 3). Do not close the worker to simulate a pause.</aside>
+<div class="queue-toolbar" id="queue-filter" role="group" aria-label="Filter jobs">
+  <button type="button" class="button small" data-filter="active">Hide finished</button>
+  <button type="button" class="button small" data-filter="all">Show all</button>
+  <span class="muted" id="queue-filter-note"></span>
+</div>
 <section id="queue-list" class="queue-list" aria-live="polite"><div class="loading">Loading queue…</div></section>
 <section class="metrics-panel" aria-label="System load">
   <div class="metrics-header">
