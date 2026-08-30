@@ -18,7 +18,7 @@ from typing import Any, Callable, TypeVar
 from webapp.config import Settings, load_settings
 from webapp.db import TRANSIENT_DB_ERRORS, connect, migrate, retry_db, transaction, utc_now
 from webapp.server.services import append_event
-from webapp.worker.idle import IdleGate, IdlePolicy
+from webapp.worker.idle import IdleGate, IdlePolicy, gpu_snapshot
 
 
 PIPELINE_PREFIX = "PIPELINE_EVENT "
@@ -26,12 +26,19 @@ PROGRESS_RE = re.compile(r"frame=\s*(\d+).*?fps=\s*([0-9.]+)")
 WRITTEN_RE = re.compile(r"Written\s+(\d+)/(\d+)\s+frames")
 CHUNK_RE = re.compile(r"Chunk\s+(\d+)/(\d+):")
 STREAM_COMPLETE_RE = re.compile(r"Streaming complete:\s+(\d+)\s+frames")
-ACTIVE_STATES = ("preparing", "running", "assembling", "cancel_requested")
+ACTIVE_STATES = ("preparing", "running", "assembling", "cancel_requested", "pause_requested", "resuming")
 
 # Returned by _run_pipeline when the worker was asked to shut down (SIGTERM,
 # e.g. `systemctl --user stop`) mid-run. The job is left in its active state so
 # restart recovery requeues it, rather than being marked failed.
 STATUS_SHUTDOWN = -100
+# Returned by _run_units when a cooperative pause was requested: the current unit
+# finished, the GPU is released, and the job is parked in 'paused' for resume.
+STATUS_PAUSED = -101
+# Returned by _run_units when the GPU is no longer free between units (a foreign
+# workload returned): the job is requeued and the idle gate auto-resumes it once
+# the GPU is idle again — non-interfering by design.
+STATUS_YIELDED = -102
 
 # Set by the SIGTERM/SIGINT handler so long-running loops can exit cleanly and
 # release the GPU (container + VRAM) instead of being hard-killed.
@@ -635,6 +642,55 @@ def _chunk_valid(settings: Settings, job_id: int, unit, unit_path: Path) -> bool
         return False
 
 
+def _set_state(settings: Settings, job_id: int, state: str, stage: str | None = None) -> None:
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            db.execute(
+                "UPDATE jobs SET state=?, stage=COALESCE(?, stage), updated_at=? WHERE id=?",
+                (state, stage, utc_now(), job_id),
+            )
+            append_event(db, job_id, "state", state=state, stage=stage)
+    retry_db(op, attempts=5, base_delay=0.3)
+
+
+def _yield_job(settings: Settings, job_id: int, reason: str) -> None:
+    """Requeue a job that yielded the GPU between units; the idle gate resumes it."""
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            db.execute(
+                "UPDATE jobs SET state='queued', start_requested=1, worker_pid=NULL, updated_at=? WHERE id=?",
+                (utc_now(), job_id),
+            )
+            append_event(db, job_id, "state", state="queued", message=f"Yielded GPU between units ({reason}); will resume when idle")
+    retry_db(op, attempts=5, base_delay=0.3)
+
+
+def _should_yield_between_units(policy: IdlePolicy) -> tuple[bool, str]:
+    """Between units the current unit's container has exited, so a shortfall of
+    free VRAM means a foreign workload returned. Confirm once to avoid a
+    transient post-exit reading before deciding to yield."""
+    snap = gpu_snapshot()
+    if not snap.ok or snap.free_mib >= policy.min_free_mib:
+        return False, ""
+    time.sleep(3)
+    snap = gpu_snapshot()
+    if not snap.ok or snap.free_mib >= policy.min_free_mib:
+        return False, ""
+    return True, f"only {snap.free_mib // 1024} GiB VRAM free"
+
+
+def _pause_job(settings: Settings, job_id: int) -> None:
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            now = utc_now()
+            db.execute(
+                "UPDATE jobs SET state='paused', worker_pid=NULL, start_requested=0, updated_at=? WHERE id=?",
+                (now, job_id),
+            )
+            append_event(db, job_id, "state", state="paused", message="Paused after completing the current unit; resume to continue")
+    retry_db(op, attempts=5, base_delay=0.3)
+
+
 def _units_frames_done(settings: Settings, job_id: int) -> None:
     def op() -> None:
         with connect(settings.database_path) as db, transaction(db):
@@ -677,7 +733,13 @@ def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path
                         log.write(line)
             for line in process.stdout:
                 log.write(line)
-            return process.wait()
+            status = process.wait()
+            # If a shutdown was requested, report shutdown even if the child
+            # exited on its own SIGTERM first (race): the job must be left for
+            # restart recovery, not marked failed.
+            if _SHUTDOWN:
+                return STATUS_SHUTDOWN
+            return status
         finally:
             if process.poll() is None:
                 _stop_container(_container_name(job["public_id"]))
@@ -731,12 +793,27 @@ def _run_units(settings: Settings, job) -> int:
     units_dir = work / "units"
     units_dir.mkdir(parents=True, exist_ok=True)
     container = _container_name(job["public_id"])
+    idle_gate_on = os.environ.get("WEDDING_IDLE_GATE") == "1"
+    idle_policy = IdlePolicy.from_env()
+    _set_state(settings, job["id"], "running", "seedvr2_restore")
 
     for unit in units:
         if _SHUTDOWN:
             return STATUS_SHUTDOWN
-        if _job_state(settings, job["id"]) == "cancel_requested":
+        state = _job_state(settings, job["id"])
+        if state == "cancel_requested":
             return 75
+        if state == "pause_requested":
+            return STATUS_PAUSED
+        # Non-interference: if a foreign workload reclaimed the GPU while the
+        # previous unit ran, yield now (the container has exited, VRAM is freed)
+        # and let the idle gate resume us later. Skip the check for unit 0 (we
+        # only got here because the gate was already open).
+        if idle_gate_on and unit["seq"] > 0:
+            yield_now, reason = _should_yield_between_units(idle_policy)
+            if yield_now:
+                _yield_job(settings, job["id"], reason)
+                return STATUS_YIELDED
         unit_path = units_dir / f"unit_{unit['seq']:05d}.mkv"
         if _chunk_valid(settings, job["id"], unit, unit_path):
             _units_frames_done(settings, job["id"])
@@ -746,7 +823,7 @@ def _run_units(settings: Settings, job) -> int:
         _ACTIVE_CONTAINER = container
         status = _run_unit(settings, job, source, start_sec, duration, unit, unit_path, log)
         _ACTIVE_CONTAINER = None
-        if status == STATUS_SHUTDOWN:
+        if status == STATUS_SHUTDOWN or _SHUTDOWN:
             return STATUS_SHUTDOWN
         if status == 75:
             return 75
@@ -762,10 +839,14 @@ def _run_units(settings: Settings, job) -> int:
 
     if _SHUTDOWN:
         return STATUS_SHUTDOWN
-    if _job_state(settings, job["id"]) == "cancel_requested":
+    state = _job_state(settings, job["id"])
+    if state == "cancel_requested":
         return 75
+    if state == "pause_requested":
+        return STATUS_PAUSED
     manifest = work / "units.manifest"
     manifest.write_text("\n".join(str(units_dir / f"unit_{u['seq']:05d}.mkv") for u in units) + "\n")
+    _set_state(settings, job["id"], "assembling", "audio_mux")
     status = _assemble(settings, job, manifest, source, start_sec, duration, log)
     if status == STATUS_SHUTDOWN:
         return STATUS_SHUTDOWN
@@ -798,6 +879,14 @@ def run_job(settings: Settings, job) -> None:
     if status == STATUS_SHUTDOWN:
         # Worker is stopping mid-run; leave the job active so restart recovery
         # requeues it for major-stage (later, durable-unit) resume.
+        return
+    if status == STATUS_PAUSED:
+        # Cooperative pause: current unit is durably saved; park in 'paused'.
+        _pause_job(settings, job["id"])
+        return
+    if status == STATUS_YIELDED:
+        # Auto-yielded between units; already requeued for the idle gate.
+        _heartbeat(settings, "idle", detail="yielded GPU; waiting for idle to resume")
         return
     if status == 75 or _job_state(settings, job["id"]) == "cancel_requested":
         _finish_error(settings, job["id"], "Cancellation completed at a pipeline stage boundary", cancelled=True)

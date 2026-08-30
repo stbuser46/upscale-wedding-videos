@@ -31,6 +31,7 @@ class Settings:
     secret_key: str | None
     free_space_reserve_bytes: int
     auto_start_jobs: bool
+    durable_units: bool
     pipeline_path: Path
 
     @property
@@ -62,5 +63,6 @@ def load_settings(*, require_password: bool = False) -> Settings:
         secret_key=os.environ.get("WEBAPP_SECRET_KEY"),
         free_space_reserve_bytes=int(reserve_gib * 1024**3),
         auto_start_jobs=_bool_env("WEBAPP_AUTO_START_JOBS", False),
+        durable_units=_bool_env("WEDDING_DURABLE_UNITS", False),
         pipeline_path=PROJECT_ROOT / "pipeline_v3.sh",
     )

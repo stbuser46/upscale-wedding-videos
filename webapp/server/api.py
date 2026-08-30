@@ -67,7 +67,7 @@ def _bounded_text(value: object, name: str, maximum: int, *, required: bool = Fa
 def session_info():
     from flask import session
 
-    return jsonify({"csrf_token": session["csrf_token"], "phase": 2, "pause_available": False})
+    return jsonify({"csrf_token": session["csrf_token"], "phase": 2, "pause_available": _settings().durable_units})
 
 
 @api.get("/metrics")
@@ -462,16 +462,50 @@ def start_job(public_id: str):
 
 @api.post("/jobs/<public_id>/pause")
 def pause_job(public_id: str):
-    with _db() as db:
-        _get_job_for_update(db, public_id)
-    abort(409, description="Pause/resume requires Phase 3 durable chunks and is not available yet")
+    if not _settings().durable_units:
+        abort(409, description="Pause requires durable-unit mode (WEDDING_DURABLE_UNITS=1)")
+    with _db() as db, transaction(db):
+        job = _get_job_for_update(db, public_id)
+        state = job["state"]
+        if state in {"paused", "pause_requested"}:
+            return jsonify({"status": state})
+        if state == "queued":
+            # Not started yet: hold it so the worker won't claim it.
+            db.execute("UPDATE jobs SET start_requested=0, updated_at=? WHERE id=?", (utc_now(), job["id"]))
+            append_event(db, job["id"], "command", state="queued", message="Job held; will not start until resumed")
+            return jsonify({"status": "held"})
+        if state not in {"preparing", "running", "assembling", "resuming"}:
+            abort(409, description=f"Job cannot be paused from {state}")
+        db.execute("UPDATE jobs SET state='pause_requested', updated_at=? WHERE id=?", (utc_now(), job["id"]))
+        append_event(
+            db, job["id"], "state", state="pause_requested", stage=job["stage"],
+            message="Pause requested; the current unit will finish first",
+        )
+    return jsonify({"status": "pause_requested", "boundary": "unit"})
 
 
 @api.post("/jobs/<public_id>/resume")
 def resume_job(public_id: str):
-    with _db() as db:
-        _get_job_for_update(db, public_id)
-    abort(409, description="Pause/resume requires Phase 3 durable chunks and is not available yet")
+    with _db() as db, transaction(db):
+        job = _get_job_for_update(db, public_id)
+        state = job["state"]
+        if state == "paused":
+            db.execute(
+                "UPDATE jobs SET state='queued', start_requested=1, updated_at=? WHERE id=?",
+                (utc_now(), job["id"]),
+            )
+            append_event(db, job["id"], "state", state="queued", message="Resumed; will continue from the first unfinished unit")
+            return jsonify({"status": "queued"})
+        if state == "pause_requested":
+            # Cancel a pending pause before it took effect.
+            db.execute("UPDATE jobs SET state='running', updated_at=? WHERE id=?", (utc_now(), job["id"]))
+            append_event(db, job["id"], "state", state="running", message="Pause cancelled; continuing")
+            return jsonify({"status": "running"})
+        if state == "queued" and not job["start_requested"]:
+            db.execute("UPDATE jobs SET start_requested=1, updated_at=? WHERE id=?", (utc_now(), job["id"]))
+            append_event(db, job["id"], "command", state="queued", message="Start requested")
+            return jsonify({"status": "start_requested"})
+        abort(409, description=f"Job cannot be resumed from {state}")
 
 
 @api.post("/jobs/<public_id>/cancel")

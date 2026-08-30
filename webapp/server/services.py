@@ -151,5 +151,10 @@ def job_dict(row: sqlite3.Row) -> dict[str, Any]:
         "queued", "preparing", "running", "assembling", "cancel_requested"
     }
     result["can_retry"] = result["state"] in {"failed", "cancelled", "interrupted"}
-    result["pause_available"] = False
+    # Per-job pause/resume affordances; the global capability (durable-unit mode)
+    # is reported by /session, and the pause route enforces it server-side.
+    result["pause_available"] = result["state"] in {"preparing", "running", "assembling", "resuming"}
+    result["resume_available"] = result["state"] in {"paused", "pause_requested"} or (
+        result["state"] == "queued" and not result["start_requested"]
+    )
     return result
