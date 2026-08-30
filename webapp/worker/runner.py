@@ -9,14 +9,16 @@ from pathlib import Path
 import re
 import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from webapp.config import Settings, load_settings
-from webapp.db import connect, migrate, transaction, utc_now
+from webapp.db import TRANSIENT_DB_ERRORS, connect, migrate, retry_db, transaction, utc_now
 from webapp.server.services import append_event
+from webapp.worker.idle import IdleGate, IdlePolicy
 
 
 PIPELINE_PREFIX = "PIPELINE_EVENT "
@@ -26,9 +28,105 @@ CHUNK_RE = re.compile(r"Chunk\s+(\d+)/(\d+):")
 STREAM_COMPLETE_RE = re.compile(r"Streaming complete:\s+(\d+)\s+frames")
 ACTIVE_STATES = ("preparing", "running", "assembling", "cancel_requested")
 
+# Returned by _run_pipeline when the worker was asked to shut down (SIGTERM,
+# e.g. `systemctl --user stop`) mid-run. The job is left in its active state so
+# restart recovery requeues it, rather than being marked failed.
+STATUS_SHUTDOWN = -100
+
+# Set by the SIGTERM/SIGINT handler so long-running loops can exit cleanly and
+# release the GPU (container + VRAM) instead of being hard-killed.
+_SHUTDOWN = False
+# Name of the GPU container for the job currently running, so the signal handler
+# and the _run_pipeline finally-path can stop it deterministically.
+_ACTIVE_CONTAINER: str | None = None
+
+T = TypeVar("T")
+
 
 class WorkerError(RuntimeError):
     pass
+
+
+def _handle_shutdown(signum, _frame) -> None:
+    global _SHUTDOWN
+    _SHUTDOWN = True
+    print(f"Received signal {signum}; shutting down worker and releasing GPU", flush=True)
+    if _ACTIVE_CONTAINER is not None:
+        _stop_container(_ACTIVE_CONTAINER)
+
+
+def _install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
+
+def _container_name(public_id: str) -> str:
+    return f"wedding-{public_id}"
+
+
+def _stop_container(name: str) -> None:
+    """Best-effort stop+remove of the GPU container. `docker stop` sends SIGTERM
+    then SIGKILL after the grace period; `--rm` on `docker run` removes it."""
+    try:
+        subprocess.run(
+            ["docker", "stop", "-t", "10", name],
+            check=False, capture_output=True, text=True, timeout=40,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _best_effort(operation: Callable[[], T]) -> T | None:
+    """Run an observational DB write, retrying briefly then swallowing failures.
+
+    Progress, events, metrics and heartbeats must never crash the worker or, mid
+    run, abort handling and orphan the GPU container. Durable state transitions
+    (claim, complete, fail) do NOT use this — they must surface their errors."""
+    try:
+        return retry_db(operation, attempts=3, base_delay=0.2, max_delay=2.0)
+    except Exception:
+        return None
+
+
+def _heartbeat(
+    settings: Settings,
+    activity: str,
+    *,
+    active_job_id: int | None = None,
+    error: str | None = None,
+    detail: str | None = None,
+    started: bool = False,
+) -> None:
+    def op() -> None:
+        with connect(settings.database_path) as db:
+            now = utc_now()
+            if started:
+                db.execute(
+                    "UPDATE worker_status SET pid=?, activity=?, active_job_id=?, detail=?, "
+                    "last_beat_at=?, started_at=?, updated_at=? WHERE id=1",
+                    (os.getpid(), activity, active_job_id, detail, now, now, now),
+                )
+            elif error is not None:
+                db.execute(
+                    "UPDATE worker_status SET pid=?, activity=?, active_job_id=?, detail=?, "
+                    "last_beat_at=?, last_error=?, last_error_at=?, updated_at=? WHERE id=1",
+                    (os.getpid(), activity, active_job_id, detail, now, error[:2000], now, now),
+                )
+            else:
+                db.execute(
+                    "UPDATE worker_status SET pid=?, activity=?, active_job_id=?, detail=?, "
+                    "last_beat_at=?, updated_at=? WHERE id=1",
+                    (os.getpid(), activity, active_job_id, detail, now, now),
+                )
+    _best_effort(op)
+
+
+def _has_startable_job(settings: Settings) -> bool:
+    with connect(settings.database_path) as db:
+        row = db.execute(
+            "SELECT 1 FROM jobs WHERE state='queued' AND start_requested=1 LIMIT 1"
+        ).fetchone()
+    return row is not None
 
 
 class GpuLock:
@@ -132,63 +230,74 @@ def _touch_cancel(control_path: Path) -> None:
 
 
 def _job_state(settings: Settings, job_id: int) -> str:
-    with connect(settings.database_path) as db:
-        row = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
-    return row["state"] if row else "cancel_requested"
+    def op() -> str:
+        with connect(settings.database_path) as db:
+            row = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return row["state"] if row else "cancel_requested"
+    result = _best_effort(op)
+    # On a transient DB failure, assume the job is still running: it is safer to
+    # keep processing than to spuriously treat an unreadable state as a cancel.
+    return result if result is not None else "running"
 
 
 def _pipeline_event(settings: Settings, job_id: int, event: dict[str, str], started: float) -> None:
     event_type = event.get("type", "pipeline")
     stage = event.get("stage")
-    now = utc_now()
-    with connect(settings.database_path) as db, transaction(db):
-        current = db.execute("SELECT state, frames_total FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if current is None:
-            return
-        state = current["state"]
-        if event_type == "stage_start" and state != "cancel_requested":
-            state = "assembling" if stage == "audio_mux" else ("preparing" if stage == "prepare_50p" else "running")
-            db.execute(
-                "UPDATE jobs SET state=?, stage=?, elapsed_seconds=?, updated_at=? WHERE id=?",
-                (state, stage, time.monotonic() - started, now, job_id),
+
+    def op() -> None:
+        now = utc_now()
+        with connect(settings.database_path) as db, transaction(db):
+            current = db.execute("SELECT state, frames_total FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if current is None:
+                return
+            state = current["state"]
+            if event_type == "stage_start" and state != "cancel_requested":
+                state = "assembling" if stage == "audio_mux" else ("preparing" if stage == "prepare_50p" else "running")
+                db.execute(
+                    "UPDATE jobs SET state=?, stage=?, elapsed_seconds=?, updated_at=? WHERE id=?",
+                    (state, stage, time.monotonic() - started, now, job_id),
+                )
+            elif event_type == "stage_complete":
+                frames_done = current["frames_total"] if stage == "seedvr2_restore" else None
+                db.execute(
+                    """UPDATE jobs SET stage=?, elapsed_seconds=?,
+                       frames_done=COALESCE(?, frames_done), updated_at=? WHERE id=?""",
+                    (stage, time.monotonic() - started, frames_done, now, job_id),
+                )
+            append_event(
+                db, job_id, "stage", state=state, stage=stage,
+                message=f"{stage.replace('_', ' ').title()}: {event_type.replace('_', ' ')}",
+                payload=event,
             )
-        elif event_type == "stage_complete":
-            frames_done = current["frames_total"] if stage == "seedvr2_restore" else None
-            db.execute(
-                """UPDATE jobs SET stage=?, elapsed_seconds=?,
-                   frames_done=COALESCE(?, frames_done), updated_at=? WHERE id=?""",
-                (stage, time.monotonic() - started, frames_done, now, job_id),
-            )
-        append_event(
-            db, job_id, "stage", state=state, stage=stage,
-            message=f"{stage.replace('_', ' ').title()}: {event_type.replace('_', ' ')}",
-            payload=event,
-        )
+    _best_effort(op)
 
 
 def _progress_update(settings: Settings, job_id: int, stage: str | None, frame: int, fps: float, started: float) -> None:
     elapsed = time.monotonic() - started
-    with connect(settings.database_path) as db, transaction(db):
-        job = db.execute("SELECT frames_total, state FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if job is None:
-            return
-        # Frame counters from preparation encodes are stage-local. Only expose
-        # completed restoration frames as end-to-end progress.
-        frames_done = min(frame, job["frames_total"]) if stage == "seedvr2_restore" else 0
-        eta = (job["frames_total"] - frames_done) / fps if fps > 0 and stage == "seedvr2_restore" else job["frames_total"] / 0.71
-        db.execute(
-            """UPDATE jobs SET frames_done=?, fps=?, elapsed_seconds=?, eta_seconds=?, updated_at=?
-               WHERE id=?""",
-            (frames_done, fps or None, elapsed, max(0, eta), utc_now(), job_id),
-        )
-        append_event(
-            db, job_id, "progress", state=job["state"], stage=stage,
-            message=None,
-            payload={
-                "frames_done": frames_done, "frames_total": job["frames_total"],
-                "fps": fps, "elapsed_seconds": round(elapsed, 1), "eta_seconds": round(max(0, eta), 1),
-            },
-        )
+
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            job = db.execute("SELECT frames_total, state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if job is None:
+                return
+            # Frame counters from preparation encodes are stage-local. Only expose
+            # completed restoration frames as end-to-end progress.
+            frames_done = min(frame, job["frames_total"]) if stage == "seedvr2_restore" else 0
+            eta = (job["frames_total"] - frames_done) / fps if fps > 0 and stage == "seedvr2_restore" else job["frames_total"] / 0.71
+            db.execute(
+                """UPDATE jobs SET frames_done=?, fps=?, elapsed_seconds=?, eta_seconds=?, updated_at=?
+                   WHERE id=?""",
+                (frames_done, fps or None, elapsed, max(0, eta), utc_now(), job_id),
+            )
+            append_event(
+                db, job_id, "progress", state=job["state"], stage=stage,
+                message=None,
+                payload={
+                    "frames_done": frames_done, "frames_total": job["frames_total"],
+                    "fps": fps, "elapsed_seconds": round(elapsed, 1), "eta_seconds": round(max(0, eta), 1),
+                },
+            )
+    _best_effort(op)
 
 
 def _system_metrics(settings: Settings) -> dict[str, Any]:
@@ -238,12 +347,15 @@ def _run_pipeline(settings: Settings, job) -> int:
         SEEDVR2_OVERLAP=str(snapshot["overlap"]),
         FORCE="0",
     )
+    global _ACTIVE_CONTAINER
     started = time.monotonic()
     last_progress = 0.0
     last_metrics = 0.0
     current_stage: str | None = "worker_checks"
     current_chunk = 1
     restore_started: float | None = None
+    container = _container_name(job["public_id"])
+    status = STATUS_SHUTDOWN
     with log_partial.open("a", encoding="utf-8", buffering=1) as log_handle:
         log_handle.write(f"[{utc_now()}] worker command: pipeline_v3.sh <registered-source> {start:.3f} {duration:.3f} <generated-output> {job['public_id']}\n")
         process = subprocess.Popen(
@@ -255,10 +367,16 @@ def _run_pipeline(settings: Settings, job) -> int:
             text=True,
             bufsize=1,
         )
+        # From here on a GPU container may be launched by the pipeline; record
+        # its name so the signal handler and the finally-path below can stop it
+        # rather than orphan ~60 GB of VRAM.
+        _ACTIVE_CONTAINER = container
         assert process.stdout is not None
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
         while process.poll() is None:
+            if _SHUTDOWN:
+                break
             if _job_state(settings, job["id"]) == "cancel_requested":
                 _touch_cancel(control)
             ready = selector.select(timeout=1)
@@ -297,34 +415,50 @@ def _run_pipeline(settings: Settings, job) -> int:
                         _progress_update(settings, job["id"], current_stage, int(match.group(1)), float(match.group(2)), started)
                         last_progress = now_mono
                     elif clean and not clean.startswith("frame="):
-                        with connect(settings.database_path) as db:
-                            append_event(db, job["id"], "log", state=_job_state(settings, job["id"]), stage=current_stage, message=clean[:4000])
+                        message = clean[:4000]
+
+                        def _log_op(message=message):
+                            with connect(settings.database_path) as db:
+                                append_event(db, job["id"], "log", state=_job_state(settings, job["id"]), stage=current_stage, message=message)
+                        _best_effort(_log_op)
             now_mono = time.monotonic()
             if now_mono - last_metrics >= 15:
                 metrics = _system_metrics(settings)
-                with connect(settings.database_path) as db, transaction(db):
-                    current = db.execute("SELECT state, eta_seconds FROM jobs WHERE id=?", (job["id"],)).fetchone()
-                    elapsed = time.monotonic() - started
-                    eta = max(0, (current["eta_seconds"] or 0) - 15) if current else None
-                    db.execute(
-                        "UPDATE jobs SET elapsed_seconds=?, eta_seconds=?, updated_at=? WHERE id=?",
-                        (elapsed, eta, utc_now(), job["id"]),
-                    )
-                    append_event(
-                        db, job["id"], "metrics", state=current["state"] if current else None,
-                        stage=current_stage, payload=metrics,
-                    )
+                _heartbeat(settings, "running", active_job_id=job["id"])
+
+                def _metrics_op(metrics=metrics):
+                    with connect(settings.database_path) as db, transaction(db):
+                        current = db.execute("SELECT state, eta_seconds FROM jobs WHERE id=?", (job["id"],)).fetchone()
+                        elapsed = time.monotonic() - started
+                        eta = max(0, (current["eta_seconds"] or 0) - 15) if current else None
+                        db.execute(
+                            "UPDATE jobs SET elapsed_seconds=?, eta_seconds=?, updated_at=? WHERE id=?",
+                            (elapsed, eta, utc_now(), job["id"]),
+                        )
+                        append_event(
+                            db, job["id"], "metrics", state=current["state"] if current else None,
+                            stage=current_stage, payload=metrics,
+                        )
+                _best_effort(_metrics_op)
                 last_metrics = now_mono
+        if _SHUTDOWN:
+            # Asked to stop mid-run: leave the job in its active state so restart
+            # recovery requeues it. The signal handler already stops the GPU
+            # container; run_job skips completion/failure for STATUS_SHUTDOWN.
+            return STATUS_SHUTDOWN
         for line in process.stdout:
             log_handle.write(line)
         status = process.wait()
     os.replace(log_partial, log)
     control.unlink(missing_ok=True)
-    with connect(settings.database_path) as db:
-        db.execute(
-            "UPDATE jobs SET elapsed_seconds=?, worker_pid=NULL, updated_at=? WHERE id=?",
-            (time.monotonic() - started, utc_now(), job["id"]),
-        )
+
+    def _clear_pid_op():
+        with connect(settings.database_path) as db:
+            db.execute(
+                "UPDATE jobs SET elapsed_seconds=?, worker_pid=NULL, updated_at=? WHERE id=?",
+                (time.monotonic() - started, utc_now(), job["id"]),
+            )
+    _best_effort(_clear_pid_op)
     return status
 
 
@@ -440,16 +574,31 @@ def run_job(settings: Settings, job) -> None:
             f"Free-space safeguard refused job: {free} bytes free, reserve is {settings.free_space_reserve_bytes} bytes",
         )
         return
+    global _ACTIVE_CONTAINER
+    container = _container_name(job["public_id"])
     try:
         status = _run_pipeline(settings, job)
-        if status == 75 or _job_state(settings, job["id"]) == "cancel_requested":
-            _finish_error(settings, job["id"], "Cancellation completed at a pipeline stage boundary", cancelled=True)
-        elif status != 0:
-            _finish_error(settings, job["id"], f"pipeline_v3.sh exited with status {status}")
-        else:
-            _validate_and_complete(settings, job)
     except Exception as exc:
+        # An unexpected failure must not leave the GPU container (and ~60 GB of
+        # VRAM) running while the job is marked failed.
+        _stop_container(container)
         _finish_error(settings, job["id"], str(exc))
+        return
+    finally:
+        _ACTIVE_CONTAINER = None
+    if status == STATUS_SHUTDOWN:
+        # Worker is stopping mid-run; leave the job active so restart recovery
+        # requeues it for major-stage (later, durable-unit) resume.
+        return
+    if status == 75 or _job_state(settings, job["id"]) == "cancel_requested":
+        _finish_error(settings, job["id"], "Cancellation completed at a pipeline stage boundary", cancelled=True)
+    elif status != 0:
+        _finish_error(settings, job["id"], f"pipeline_v3.sh exited with status {status}")
+    else:
+        try:
+            _validate_and_complete(settings, job)
+        except Exception as exc:
+            _finish_error(settings, job["id"], str(exc))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -458,14 +607,54 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     args = parser.parse_args(argv)
     settings = load_settings()
-    migrate(settings.database_path)
+    _install_signal_handlers()
+    # The database may be briefly unavailable right after a reboot (filesystem
+    # not mounted yet). Retry indefinitely instead of dying — this was the
+    # historical "worker stopped after SQLite-open errors following a reboot".
+    retry_db(
+        lambda: migrate(settings.database_path),
+        attempts=0, base_delay=1.0, max_delay=30.0,
+        on_error=lambda exc, attempt, delay: print(
+            f"Database not ready (attempt {attempt}); retrying in {delay:.0f}s: {exc}", flush=True
+        ),
+    )
+    # Passive idle gate: when enabled, only claim a job once the GPU has been
+    # continuously idle (no foreign compute process, enough free VRAM) for the
+    # dwell time. Prevents starting SeedVR2 into a busy GPU and OOMing — exactly
+    # the failure seen when the torrent stack's ollama holds ~56 GiB.
+    idle_gate = IdleGate(IdlePolicy.from_env()) if os.environ.get("WEDDING_IDLE_GATE") == "1" else None
+    gate_poll_seconds = 2.0
     with GpuLock(settings.data_dir / "worker" / "gpu.lock"):
-        _recover_interrupted(settings)
-        while True:
-            job = _claim_next(settings)
+        _heartbeat(settings, "idle", started=True)
+        try:
+            retry_db(lambda: _recover_interrupted(settings), attempts=5, base_delay=0.5)
+        except Exception as exc:
+            _heartbeat(settings, "idle", error=f"interrupted-job recovery failed: {exc}")
+            print(f"Recovery failed (continuing): {exc}", flush=True)
+        backoff = max(0.2, args.poll_seconds)
+        while not _SHUTDOWN:
+            # Idle gate: if work is waiting but the GPU is not idle enough, hold
+            # off claiming and report why, rather than starting and OOMing.
+            if idle_gate is not None and not args.once:
+                startable = _best_effort(lambda: _has_startable_job(settings))
+                if startable and not idle_gate.poll():
+                    _heartbeat(settings, "waiting", detail=idle_gate.last_reason)
+                    time.sleep(gate_poll_seconds)
+                    continue
+            try:
+                job = retry_db(lambda: _claim_next(settings), attempts=5, base_delay=0.5, max_delay=10.0)
+            except TRANSIENT_DB_ERRORS as exc:
+                _heartbeat(settings, "db_error", error=str(exc))
+                print(f"Job claim failed after retries; backing off {backoff:.0f}s: {exc}", flush=True)
+                time.sleep(min(30.0, backoff))
+                backoff = min(30.0, backoff * 2)
+                continue
+            backoff = max(0.2, args.poll_seconds)
             if job is not None:
                 print(f"Claimed {job['public_id']}: {job['display_name']}", flush=True)
+                _heartbeat(settings, "running", active_job_id=job["id"])
                 run_job(settings, job)
+                _heartbeat(settings, "idle")
                 if args.once:
                     break
             elif args.once:
@@ -473,6 +662,8 @@ def main(argv: list[str] | None = None) -> None:
                 break
             else:
                 time.sleep(max(0.2, args.poll_seconds))
+        if _SHUTDOWN:
+            _heartbeat(settings, "stopped")
 
 
 if __name__ == "__main__":

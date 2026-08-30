@@ -88,7 +88,7 @@ Every job therefore has a faithful reference that can be compared with the AI
 result in motion.
 
 This stage is CPU-only (about 30 minutes per chapter) and leaves the GPU idle,
-and the baseline is never part of the restored output. For production fan-out
+and the baseline is never part of the restored output. For unattended production
 runs where the quality is already trusted, set `SKIP_BASELINE=1` to omit it and
 send the GPU straight from deinterlacing into restoration. The restored result
 is unchanged; only the throwaway comparison file is skipped. Default is `0`

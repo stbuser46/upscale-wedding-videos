@@ -104,7 +104,7 @@ development server publicly.
 
 Each job's stage 2 produces a non-AI comparison encode that costs ~30 CPU
 minutes and leaves the GPU idle, and it never forms part of the restored
-output. To reclaim that idle time on long fan-out runs, start the worker with
+output. To reclaim that idle time on long unattended runs, start the worker with
 `SKIP_BASELINE=1` in its environment — the worker forwards its environment to
 `pipeline_v3.sh`, which then jumps straight from deinterlacing to restoration.
 The restored result is byte-identical; only the throwaway comparison file is

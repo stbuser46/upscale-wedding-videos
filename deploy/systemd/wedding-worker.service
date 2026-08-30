@@ -1,0 +1,34 @@
+[Unit]
+Description=Wedding restoration GPU worker
+Wants=network-online.target
+After=network-online.target wedding-web.service
+
+[Service]
+Type=exec
+WorkingDirectory=/home/yacoob/Projects/upscale-wedding-videos
+# Wait for Docker (a system service a user unit cannot order against directly)
+# before entering the claim loop, so the first claimed job's `docker run` works.
+ExecStartPre=/bin/sh -c 'until docker info >/dev/null 2>&1; do echo "waiting for docker..."; sleep 2; done'
+# SKIP_BASELINE=1 omits the throwaway non-AI comparison encode (~30 CPU-min/GPU-
+# idle per chapter). The worker forwards its environment to pipeline_v3.sh.
+Environment=SKIP_BASELINE=1
+ExecStart=/home/yacoob/Projects/upscale-wedding-videos/webapp/.venv/bin/python -m webapp.worker.runner
+# The worker exits 0 on SIGTERM (releasing the GPU); restart only on crash.
+Restart=on-failure
+RestartSec=5
+# systemctl stop sends SIGTERM: the worker stops the GPU container and leaves
+# the job for restart recovery. Give it room before SIGKILL.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+# Be a polite neighbour for interactive work. NOTE: the heavy stages run inside
+# Docker containers owned by the system dockerd, so these weights only apply to
+# the worker process itself and its direct ffmpeg children, not the GPU
+# container — real GPU yielding is handled by the idle gate (see plan step 6).
+Nice=10
+CPUWeight=30
+IOWeight=30
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=default.target

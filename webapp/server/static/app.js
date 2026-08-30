@@ -410,6 +410,32 @@ function initMetrics() {
   window.setInterval(loadMetrics, 10000);
 }
 
+async function refreshWorkerHealth() {
+  const pill = document.getElementById("worker-health");
+  if (!pill) return;
+  try {
+    const h = await api("/api/worker/health");
+    let label, state;
+    if (!h.present) { label = "worker: n/a"; state = "unknown"; }
+    else if (h.alive && h.activity === "waiting") { label = h.detail || "worker: waiting"; state = "warn"; }
+    else if (h.alive) { label = `worker: ${h.activity}`; state = h.activity === "db_error" ? "warn" : "ok"; }
+    else { label = h.activity === "stopped" ? "worker: stopped" : "worker: down"; state = "down"; }
+    pill.textContent = label;
+    pill.dataset.state = state;
+    const bits = [];
+    if (h.detail) bits.push(h.detail);
+    if (h.last_beat_at) bits.push(`last beat ${h.last_beat_at}`);
+    if (h.active_job_id) bits.push(`job #${h.active_job_id}`);
+    if (h.last_error) bits.push(`last error: ${h.last_error}`);
+    pill.title = bits.join(" · ") || "GPU worker status";
+  } catch (_) {
+    pill.textContent = "worker: ?";
+    pill.dataset.state = "unknown";
+  }
+}
+refreshWorkerHealth();
+window.setInterval(refreshWorkerHealth, 10000);
+
 const page = document.body.dataset.page;
 if (page === "library" && document.body.dataset.titleId) loadTitle();
 else if (page === "library") loadLibrary();

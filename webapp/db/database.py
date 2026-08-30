@@ -4,14 +4,53 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 import sqlite3
-from typing import Iterator
+import time
+from typing import Callable, Iterator, TypeVar
 
 
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 
+# Errors that are worth retrying rather than crashing on: the database file not
+# yet mounted/created after a reboot, a locked database, or a transient I/O
+# failure. sqlite3.OperationalError covers "unable to open database file" and
+# "database is locked"; OSError covers the filesystem not being ready yet.
+TRANSIENT_DB_ERRORS = (sqlite3.OperationalError, OSError)
+
+T = TypeVar("T")
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def retry_db(
+    operation: Callable[[], T],
+    *,
+    attempts: int = 8,
+    base_delay: float = 0.5,
+    max_delay: float = 30.0,
+    on_error: Callable[[Exception, int, float], None] | None = None,
+) -> T:
+    """Run a DB operation, retrying transient failures with exponential backoff.
+
+    ``attempts <= 0`` retries indefinitely (used for startup, where the database
+    may simply not be available yet after a reboot). Non-transient errors and
+    the final failed attempt propagate to the caller.
+    """
+    delay = base_delay
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return operation()
+        except TRANSIENT_DB_ERRORS as exc:
+            last_attempt = attempts > 0 and attempt >= attempts
+            if last_attempt:
+                raise
+            if on_error is not None:
+                on_error(exc, attempt, delay)
+            time.sleep(delay)
+            delay = min(max_delay, delay * 2)
 
 
 def connect(database_path: Path | str) -> sqlite3.Connection:

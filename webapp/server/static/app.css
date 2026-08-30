@@ -61,6 +61,12 @@ main { width: min(1280px, calc(100% - 48px)); margin: 0 auto; padding: 58px 0 90
 .title-row a { font-weight: 700; text-decoration: none; }
 .title-row small { color: var(--muted); display: block; margin-top: 4px; }
 .badge { display: inline-flex; padding: 5px 9px; border-radius: 999px; background: #eee9e1; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.worker-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 999px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; background: #ece6de; color: var(--muted); border: 1px solid var(--line); white-space: nowrap; }
+.worker-pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.worker-pill[data-state="ok"] { background: #dfeadd; color: #2c7a4b; border-color: #bcd8bd; }
+.worker-pill[data-state="warn"] { background: #f3ead8; color: #8a6d3b; border-color: #e3d3ad; }
+.worker-pill[data-state="down"] { background: #f5e0dd; color: #a13a30; border-color: #e6c3bd; }
+.worker-pill[data-state="unknown"] { background: #ece6de; color: var(--muted); }
 .loading, .empty-state { padding: 60px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 20px; grid-column: 1 / -1; }
 .title-heading { padding: 12px 0 38px; }
 .back-link { display: inline-block; margin-bottom: 40px; color: var(--muted); text-decoration: none; }

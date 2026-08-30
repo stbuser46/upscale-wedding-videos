@@ -38,8 +38,8 @@ COMPILE=${SEEDVR2_COMPILE:-1}
 FORCE=${FORCE:-0}
 # The stage-2 baseline is a non-AI 1440p50 x265 comparison encode. It is never
 # muxed into the restored output and takes ~30 CPU-minutes per chapter, during
-# which the GPU sits idle. SKIP_BASELINE=1 omits it for production fan-out runs
-# (quality of the restored result is unaffected). Default 0 keeps prior behaviour.
+# which the GPU sits idle. SKIP_BASELINE=1 omits it for unattended production
+# runs (quality of the restored result is unaffected). Default 0 keeps prior behaviour.
 SKIP_BASELINE=${SKIP_BASELINE:-0}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
@@ -197,7 +197,12 @@ if [[ ! -s "$RESTORED" ]]; then
     COMPILE_ARGS=(--compile_vae --cache_vae)
   fi
   set +e
-  docker run --rm --gpus all --ipc=host \
+  # Deterministic container name so the worker can stop/remove this GPU
+  # container on abnormal exit (systemd stop, crash) instead of orphaning
+  # ~60 GB of VRAM. Clear any stale same-named container from a prior crash.
+  RESTORE_CONTAINER="wedding-${TAG}"
+  docker rm -f "$RESTORE_CONTAINER" >/dev/null 2>&1 || true
+  docker run --rm --name "$RESTORE_CONTAINER" --gpus all --ipc=host \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "${PROJECT_MOUNTS[@]}" \

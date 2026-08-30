@@ -1,0 +1,20 @@
+[Unit]
+Description=Wedding restoration web app (gunicorn)
+# Best-effort ordering; Docker is a system service so a user unit cannot hard-
+# depend on it. The app itself tolerates the DB not being ready yet.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/home/yacoob/Projects/upscale-wedding-videos
+# start-server.sh sources webapp/data/webapp.env (WEBAPP_PASSWORD,
+# WEBAPP_AUTO_START_JOBS) and execs gunicorn on 127.0.0.1:8093.
+ExecStart=/home/yacoob/Projects/upscale-wedding-videos/webapp/data/start-server.sh
+Restart=on-failure
+RestartSec=5
+# Keep the web UI responsive; it is not the heavy workload.
+Nice=0
+
+[Install]
+WantedBy=default.target

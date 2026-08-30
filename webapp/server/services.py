@@ -1,10 +1,114 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sqlite3
 from typing import Any
+import uuid
 
 from webapp.db import utc_now
+
+
+PRIORITY_NAMES = {"high": 100, "normal": 50, "low": 10}
+# States that keep a job "live" for the per-target unique index and for the
+# reconciler's dedup — anything not in this set means the target is free again.
+TERMINAL_STATES = ("completed", "failed", "cancelled")
+
+
+class QueueError(Exception):
+    """Raised by the shared enqueue path; `code` maps to an HTTP status in the
+    API layer and is inspected by the reconciler (which never uses Flask)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def build_job_snapshot() -> dict[str, Any]:
+    """The pinned SeedVR2 settings recorded on every job. Single source of truth
+    shared by the interactive API and the automatic backlog reconciler."""
+    return {
+        "pipeline": "v3",
+        "model": "seedvr2_ema_3b_fp16.safetensors",
+        "resolution": 1440,
+        "batch": 129,
+        "chunk": 750,
+        "overlap": 4,
+        "output_fps": 50,
+        "cancel_semantics": "stage_boundary",
+    }
+
+
+def resolve_target(db: sqlite3.Connection, target_type: str, target_id: int) -> dict[str, Any]:
+    """Look up a chapter/slice for queueing. Raises QueueError on invalid type,
+    missing target, or a skipped chapter."""
+    if target_type == "chapter":
+        row = db.execute(
+            """SELECT c.id, c.title_id, c.start_ms, c.end_ms,
+                      COALESCE(c.user_label, c.generated_label) AS display_name,
+                      c.priority, d.slug, t.title_number, t.source_cache_path
+               FROM chapters c JOIN titles t ON t.id=c.title_id
+               JOIN discs d ON d.id=t.disc_id WHERE c.id=?""",
+            (target_id,),
+        ).fetchone()
+        if row is not None and row["priority"] == "skip":
+            raise QueueError("skip", "Skipped chapters cannot be queued")
+    elif target_type == "slice":
+        row = db.execute(
+            """SELECT s.id, s.title_id, s.start_ms, s.end_ms, s.name AS display_name,
+                      s.priority, d.slug, t.title_number, t.source_cache_path
+               FROM slices s JOIN titles t ON t.id=s.title_id
+               JOIN discs d ON d.id=t.disc_id WHERE s.id=?""",
+            (target_id,),
+        ).fetchone()
+    else:
+        raise QueueError("invalid", "target_type must be chapter or slice")
+    if row is None:
+        raise QueueError("not_found", f"{target_type.title()} not found")
+    return dict(row)
+
+
+def find_active_job(db: sqlite3.Connection, target_type: str, target_id: int) -> sqlite3.Row | None:
+    return db.execute(
+        f"""SELECT * FROM jobs WHERE target_type=? AND target_id=?
+            AND state NOT IN ({','.join('?' for _ in TERMINAL_STATES)})""",
+        (target_type, target_id, *TERMINAL_STATES),
+    ).fetchone()
+
+
+def insert_job(db, settings, target: dict, target_type: str, target_id: int, position: int) -> sqlite3.Row:
+    """Insert one queued job for a resolved target and record its queued event.
+    Mirrors the interactive create path exactly; callers own the transaction and
+    the duplicate check (the partial unique index is the final guard)."""
+    public_id = f"restore-{uuid.uuid4().hex[:12]}"
+    duration_ms = target["end_ms"] - target["start_ms"]
+    snapshot = build_job_snapshot()
+    priority = PRIORITY_NAMES[target["priority"]]
+    now = utc_now()
+    output_path = settings.data_dir / "outputs" / f"{public_id}.mkv"
+    baseline_path = settings.data_dir / "restoration_work" / public_id / "baseline_1440p50.mkv"
+    log_path = settings.data_dir / "logs" / f"{public_id}.log"
+    cursor = db.execute(
+        """INSERT INTO jobs
+           (public_id, target_type, target_id, title_id, source_start_ms,
+            source_end_ms, display_name, settings_json, priority,
+            queue_position, start_requested, frames_total, output_path,
+            baseline_path, log_path, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            public_id, target_type, target_id, target["title_id"], target["start_ms"],
+            target["end_ms"], target["display_name"], json.dumps(snapshot, sort_keys=True),
+            priority, position, int(settings.auto_start_jobs), round(duration_ms / 20),
+            str(output_path), str(baseline_path), str(log_path), now, now,
+        ),
+    )
+    job_id = int(cursor.lastrowid)
+    append_event(
+        db, job_id, "state", state="queued", message="Restoration queued",
+        payload={"estimated_bytes": round(duration_ms / 1000 * 32_000_000)},
+    )
+    return db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
 
 
 def append_event(

@@ -17,6 +17,7 @@
     <nav>
       <a href="{{ url_for('library') }}" {% if page == 'library' %}aria-current="page"{% endif %}>Library</a>
       <a href="{{ url_for('queue') }}" {% if page == 'queue' %}aria-current="page"{% endif %}>Restoration queue</a>
+      <span id="worker-health" class="worker-pill" data-state="unknown" title="GPU worker status">worker: …</span>
       <form action="{{ url_for('logout') }}" method="post"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link-button">Sign out</button></form>
     </nav>
   </header>
