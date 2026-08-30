@@ -566,6 +566,214 @@ def _finish_error(settings: Settings, job_id: int, message: str, *, cancelled: b
         append_event(db, job_id, "state", state=state, message=message)
 
 
+def _probe_frame_count(settings: Settings, path: Path) -> int:
+    relative = path.resolve().relative_to(settings.data_dir)
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "-v", f"{settings.data_dir}:/data:ro",
+         "--entrypoint", "ffprobe", settings.ffmpeg_image, "-v", "error", "-count_frames",
+         "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
+         f"/data/{relative}"],
+        check=True, capture_output=True, text=True,
+    )
+    return int(result.stdout.strip() or 0)
+
+
+def _plan_units(frames_total: int, chunk: int, overlap: int) -> list[dict[str, int]]:
+    """Split a job's output frames into durable units. Unit 0 uses a reversed
+    warm-up (prepend); later units carry `overlap` raw context frames that are
+    dropped from the output so each unit holds exactly its new frames."""
+    units: list[dict[str, int]] = []
+    seq = 0
+    start = 0
+    while start < frames_total:
+        new = min(chunk, frames_total - start)
+        if seq == 0:
+            units.append(dict(seq=0, start=0, new=new, skip=0, cap=new, prepend=overlap, drop=0, ctx=0))
+        else:
+            units.append(dict(seq=seq, start=start, new=new, skip=start - overlap,
+                              cap=new + overlap, prepend=0, drop=overlap, ctx=overlap))
+        start += new
+        seq += 1
+    return units
+
+
+def _record_chunk(settings, job_id, unit, unit_path: Path, state: str, frame_count: int | None = None) -> None:
+    relative = str(unit_path.resolve().relative_to(settings.data_dir))
+
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            now = utc_now()
+            db.execute(
+                """INSERT INTO job_chunks
+                   (job_id, sequence, source_start_ms, source_end_ms, context_before_frames,
+                    warmup_frames, state, frame_count, artifact_path, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, sequence) DO UPDATE SET state=excluded.state,
+                     frame_count=excluded.frame_count, artifact_path=excluded.artifact_path,
+                     updated_at=excluded.updated_at""",
+                (job_id, unit["seq"], round(unit["start"] * 20), round((unit["start"] + unit["new"]) * 20),
+                 unit["ctx"], unit["prepend"], state, frame_count, relative, now, now),
+            )
+    retry_db(op, attempts=5, base_delay=0.3)
+
+
+def _chunk_valid(settings: Settings, job_id: int, unit, unit_path: Path) -> bool:
+    """Resume guard: a unit is reusable only if its row is 'valid', the file
+    exists, and its actual frame count matches — never trust the row alone."""
+    if not unit_path.is_file() or unit_path.stat().st_size == 0:
+        return False
+    with connect(settings.database_path) as db:
+        row = db.execute(
+            "SELECT state, frame_count FROM job_chunks WHERE job_id=? AND sequence=?",
+            (job_id, unit["seq"]),
+        ).fetchone()
+    if not row or row["state"] != "valid" or row["frame_count"] != unit["new"]:
+        return False
+    try:
+        return _probe_frame_count(settings, unit_path) == unit["new"]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def _units_frames_done(settings: Settings, job_id: int) -> None:
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            total = db.execute(
+                "SELECT COALESCE(SUM(frame_count), 0) FROM job_chunks WHERE job_id=? AND state='valid'",
+                (job_id,),
+            ).fetchone()[0]
+            db.execute("UPDATE jobs SET frames_done=?, updated_at=? WHERE id=?", (total, utc_now(), job_id))
+    _best_effort(op)
+
+
+def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path: Path) -> int:
+    """Run a child process, tee its output to the job log, and honour shutdown
+    (release the GPU) and cooperative cancel between the pipeline's stages."""
+    control = settings.data_dir / "control" / f"{job['public_id']}.cancel"
+    with log_path.open("a", encoding="utf-8", buffering=1) as log:
+        process = subprocess.Popen(
+            command, cwd=settings.project_root, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while process.poll() is None:
+                if _SHUTDOWN:
+                    _stop_container(_container_name(job["public_id"]))
+                    process.terminate()
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    return STATUS_SHUTDOWN
+                if _job_state(settings, job["id"]) == "cancel_requested":
+                    _touch_cancel(control)
+                for key, _ in selector.select(timeout=1):
+                    line = key.fileobj.readline()
+                    if line:
+                        log.write(line)
+            for line in process.stdout:
+                log.write(line)
+            return process.wait()
+        finally:
+            if process.poll() is None:
+                _stop_container(_container_name(job["public_id"]))
+                process.terminate()
+
+
+def _run_unit(settings, job, source, start_sec, duration, unit, unit_path: Path, log_path: Path) -> int:
+    snapshot = json.loads(job["settings_json"])
+    env = os.environ.copy()
+    env.update(
+        PIPELINE_WORK_ROOT=str(settings.data_dir / "restoration_work"),
+        PIPELINE_FREE_SPACE_RESERVE_BYTES=str(settings.free_space_reserve_bytes),
+        SEEDVR2_MODEL=str(snapshot["model"]), SEEDVR2_RESOLUTION=str(snapshot["resolution"]),
+        SEEDVR2_BATCH=str(snapshot["batch"]), SEEDVR2_CHUNK=str(snapshot["chunk"]),
+        SEEDVR2_OVERLAP=str(snapshot["overlap"]), FORCE="0",
+        UNIT_OUTPUT=str(unit_path), UNIT_SKIP=str(unit["skip"]), UNIT_LOAD_CAP=str(unit["cap"]),
+        UNIT_PREPEND=str(unit["prepend"]), UNIT_DROP=str(unit["drop"]),
+    )
+    command = [str(settings.pipeline_path), str(source), f"{start_sec:.3f}", f"{duration:.3f}",
+               str(job["output_path"]), job["public_id"]]
+    return _run_logged(settings, job, command, env, log_path)
+
+
+def _assemble(settings, job, manifest: Path, source, start_sec, duration, log_path: Path) -> int:
+    env = os.environ.copy()
+    env.setdefault("WEBAPP_FFMPEG_IMAGE", "upscaler-cuda:latest")
+    command = [str(settings.project_root / "assemble_units.sh"), str(manifest), str(source),
+               f"{start_sec:.3f}", f"{duration:.3f}", str(job["output_path"])]
+    return _run_logged(settings, job, command, env, log_path)
+
+
+def _run_units(settings: Settings, job) -> int:
+    """Durable-unit restoration: restore each unit as an independent SeedVR2 run,
+    record it in job_chunks, and assemble the validated units losslessly. Resumes
+    from the first non-valid unit; releases the GPU cleanly on pause/yield."""
+    global _ACTIVE_CONTAINER
+    source = _allowed_source(settings, job["source_cache_path"])
+    output = Path(job["output_path"]).resolve()
+    log = Path(job["log_path"]).resolve()
+    for generated in (output, log):
+        if not generated.is_relative_to(settings.data_dir):
+            raise WorkerError("Generated job path escaped the application data directory")
+        generated.parent.mkdir(parents=True, exist_ok=True)
+    duration = (job["source_end_ms"] - job["source_start_ms"]) / 1000
+    start_sec = job["source_start_ms"] / 1000
+    snapshot = json.loads(job["settings_json"])
+    chunk = int(snapshot["chunk"])
+    overlap = int(snapshot["overlap"])
+    units = _plan_units(job["frames_total"], chunk, overlap)
+    work = settings.data_dir / "restoration_work" / job["public_id"]
+    units_dir = work / "units"
+    units_dir.mkdir(parents=True, exist_ok=True)
+    container = _container_name(job["public_id"])
+
+    for unit in units:
+        if _SHUTDOWN:
+            return STATUS_SHUTDOWN
+        if _job_state(settings, job["id"]) == "cancel_requested":
+            return 75
+        unit_path = units_dir / f"unit_{unit['seq']:05d}.mkv"
+        if _chunk_valid(settings, job["id"], unit, unit_path):
+            _units_frames_done(settings, job["id"])
+            continue
+        _record_chunk(settings, job["id"], unit, unit_path, "running")
+        _heartbeat(settings, "running", active_job_id=job["id"], detail=f"unit {unit['seq'] + 1}/{len(units)}")
+        _ACTIVE_CONTAINER = container
+        status = _run_unit(settings, job, source, start_sec, duration, unit, unit_path, log)
+        _ACTIVE_CONTAINER = None
+        if status == STATUS_SHUTDOWN:
+            return STATUS_SHUTDOWN
+        if status == 75:
+            return 75
+        if status != 0:
+            _record_chunk(settings, job["id"], unit, unit_path, "invalid")
+            raise WorkerError(f"Unit {unit['seq']} failed with status {status}")
+        actual = _probe_frame_count(settings, unit_path)
+        if actual != unit["new"]:
+            _record_chunk(settings, job["id"], unit, unit_path, "invalid")
+            raise WorkerError(f"Unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
+        _record_chunk(settings, job["id"], unit, unit_path, "valid", frame_count=actual)
+        _units_frames_done(settings, job["id"])
+
+    if _SHUTDOWN:
+        return STATUS_SHUTDOWN
+    if _job_state(settings, job["id"]) == "cancel_requested":
+        return 75
+    manifest = work / "units.manifest"
+    manifest.write_text("\n".join(str(units_dir / f"unit_{u['seq']:05d}.mkv") for u in units) + "\n")
+    status = _assemble(settings, job, manifest, source, start_sec, duration, log)
+    if status == STATUS_SHUTDOWN:
+        return STATUS_SHUTDOWN
+    if status != 0:
+        raise WorkerError(f"Assembly failed with status {status}")
+    return 0
+
+
 def run_job(settings: Settings, job) -> None:
     free = shutil.disk_usage(settings.data_dir).free
     if free < settings.free_space_reserve_bytes:
@@ -576,8 +784,9 @@ def run_job(settings: Settings, job) -> None:
         return
     global _ACTIVE_CONTAINER
     container = _container_name(job["public_id"])
+    durable = os.environ.get("WEDDING_DURABLE_UNITS") == "1"
     try:
-        status = _run_pipeline(settings, job)
+        status = _run_units(settings, job) if durable else _run_pipeline(settings, job)
     except Exception as exc:
         # An unexpected failure must not leave the GPU container (and ~60 GB of
         # VRAM) running while the job is marked failed.

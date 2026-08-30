@@ -27,9 +27,14 @@ RUN sed -i '/^torch$/d;/^torchvision$/d' requirements.txt \
 # explicit so the HD result is limited-range BT.709 and carries correct tags.
 COPY writer-color.patch /tmp/writer-color.patch
 COPY streaming-prepend.patch /tmp/streaming-prepend.patch
+# --drop_leading N: drop the first N output frames before writing, so a durable
+# unit resumed with N raw context frames yields exactly its new frames in a
+# single encode (see docs — durable-unit restoration).
+COPY unit-drop-leading.patch /tmp/unit-drop-leading.patch
 RUN git apply /tmp/writer-color.patch \
     && git apply /tmp/streaming-prepend.patch \
-    && rm /tmp/writer-color.patch /tmp/streaming-prepend.patch
+    && git apply /tmp/unit-drop-leading.patch \
+    && rm /tmp/writer-color.patch /tmp/streaming-prepend.patch /tmp/unit-drop-leading.patch
 
 # torch.compile (Inductor) requires a host C compiler at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \

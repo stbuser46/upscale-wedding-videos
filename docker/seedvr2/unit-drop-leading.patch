@@ -1,0 +1,28 @@
+--- a/inference_cli.py	2026-08-30 11:33:04.886350811 +0100
++++ b/inference_cli.py	2026-08-30 11:33:04.895807568 +0100
+@@ -552,6 +552,16 @@
+             ):
+                 chunk_count += 1
+                 
++                # Durable-unit resume: the first `drop_leading` output frames are
++                # re-processed context shared with the previous unit — discard them
++                # here so the unit file holds exactly its new frames (single encode).
++                if getattr(args, "drop_leading", 0) > 0:
++                    _d = min(args.drop_leading, result.shape[0])
++                    result = result[_d:]
++                    args.drop_leading -= _d
++                    if result.shape[0] == 0:
++                        del result
++                        continue
+                 # Save output
+                 if is_png:
+                     save_frames_to_image(result, output_path, base_name, start_index=frames_written)
+@@ -1400,6 +1410,8 @@
+                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
+     process_group.add_argument("--temporal_overlap", type=int, default=0,
+                         help="Frames to overlap between batches/GPUs for smooth blending (default: 0)")
++    process_group.add_argument("--drop_leading", type=int, default=0,
++                        help="Drop the first N output frames before writing (durable-unit resume context). Default: 0")
+     
+     # Quality Control
+     quality_group = parser.add_argument_group('Quality control')

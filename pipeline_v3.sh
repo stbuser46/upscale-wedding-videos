@@ -19,7 +19,7 @@ SS=$2
 DUR=$3
 OUT=$4
 TAG=${5:-v3}
-IMAGE=seedvr2-cuda:v3
+IMAGE=${SEEDVR2_IMAGE:-seedvr2-cuda:v3}
 MODEL=${SEEDVR2_MODEL:-seedvr2_ema_3b_fp16.safetensors}
 RESOLUTION=${SEEDVR2_RESOLUTION:-1440}
 BATCH=${SEEDVR2_BATCH:-129}
@@ -35,6 +35,10 @@ OVERLAP=${SEEDVR2_OVERLAP:-4}
 # sees fixed 1024px tiles, so its compilation is shape-stable: 60.1 GB peak,
 # flat across chunks. SEEDVR2_COMPILE=0 restores the exact pre-compile path.
 COMPILE=${SEEDVR2_COMPILE:-1}
+COMPILE_ARGS=()
+if [[ "$COMPILE" == 1 ]]; then
+  COMPILE_ARGS=(--compile_vae --cache_vae)
+fi
 FORCE=${FORCE:-0}
 # The stage-2 baseline is a non-AI 1440p50 x265 comparison encode. It is never
 # muxed into the restored output and takes ~30 CPU-minutes per chapter, during
@@ -164,6 +168,74 @@ fi
 emit_event "stage_complete" "prepare_50p"
 check_cancel "prepare_50p"
 
+# ── Durable-unit mode ────────────────────────────────────────────────────────
+# When UNIT_OUTPUT is set, restore exactly ONE unit of the prepared 50p input as
+# a standalone HEVC file and exit. Stage 1 above is reused across a job's units
+# (same WORK dir). The worker orchestrates units, pause/yield between them, and
+# final assembly (assemble_units.sh). Stages 2 (baseline) and 4 (mux) are skipped.
+#   UNIT_SKIP      first source frame to read (unit_start - context)
+#   UNIT_LOAD_CAP  frames to read (context + new frames for this unit)
+#   UNIT_PREPEND   reversed warm-up frames (4 for unit 0, else 0) — auto-removed
+#   UNIT_DROP      leading context outputs to discard (0 for unit 0, else context)
+if [[ -n "${UNIT_OUTPUT:-}" ]]; then
+  case "$UNIT_OUTPUT" in
+    /*) UOUT=$UNIT_OUTPUT ;;
+    *)  UOUT=$PROJ/$UNIT_OUTPUT ;;
+  esac
+  case "$UOUT" in
+    "$PROJ"/*) ;;
+    *) echo "UNIT_OUTPUT must be inside the project: $UOUT" >&2; exit 2 ;;
+  esac
+  : "${UNIT_LOAD_CAP:?UNIT_LOAD_CAP is required in unit mode}"
+  UNIT_SKIP=${UNIT_SKIP:-0}
+  UNIT_PREPEND=${UNIT_PREPEND:-0}
+  UNIT_DROP=${UNIT_DROP:-0}
+  UOUT_PART=${UOUT%.*}.partial.${UOUT##*.}
+  mkdir -p "$(dirname "$UOUT")"
+  check_free_space "seedvr2_restore"
+  emit_event "stage_start" "seedvr2_restore"
+  if [[ -s "$UOUT" ]]; then
+    echo "[unit] reuse $UOUT"
+    emit_event "stage_complete" "seedvr2_restore"
+    echo "UNIT DONE $UOUT"
+    exit 0
+  fi
+  echo "[unit] skip=$UNIT_SKIP cap=$UNIT_LOAD_CAP prepend=$UNIT_PREPEND drop=$UNIT_DROP -> $UOUT"
+  rm -f "$UOUT_PART"
+  RESTORE_CONTAINER="wedding-${TAG}"
+  docker rm -f "$RESTORE_CONTAINER" >/dev/null 2>&1 || true
+  set +e
+  docker run --rm --name "$RESTORE_CONTAINER" --gpus all --ipc=host \
+    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PROJECT_MOUNTS[@]}" \
+    "$IMAGE" \
+    "/proj/${DEINTERLACED#"$PROJ/"}" \
+    --output "/proj/${UOUT_PART#"$PROJ/"}" \
+    --model_dir /proj/models/seedvr2 \
+    --dit_model "$MODEL" \
+    --resolution "$RESOLUTION" \
+    --batch_size "$BATCH" --uniform_batch_size \
+    --chunk_size 0 --temporal_overlap "$OVERLAP" \
+    --skip_first_frames "$UNIT_SKIP" --load_cap "$UNIT_LOAD_CAP" \
+    --prepend_frames "$UNIT_PREPEND" --drop_leading "$UNIT_DROP" \
+    --color_correction lab \
+    --vae_encode_tiled --vae_decode_tiled \
+    --video_backend ffmpeg --10bit --debug \
+    ${COMPILE_ARGS[@]+"${COMPILE_ARGS[@]}"} 2>&1 | tee "$LOG"
+  unit_status=${PIPESTATUS[0]}
+  set -e
+  if (( unit_status != 0 )); then
+    echo "SeedVR2 unit failed; see $LOG" >&2
+    exit "$unit_status"
+  fi
+  mv -f "$UOUT_PART" "$UOUT"
+  emit_event "stage_complete" "seedvr2_restore"
+  echo "UNIT DONE $UOUT"
+  exit 0
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
 check_free_space "baseline_encode"
 emit_event "stage_start" "baseline_encode"
 if [[ "$SKIP_BASELINE" == 1 ]]; then
@@ -192,10 +264,6 @@ emit_event "stage_start" "seedvr2_restore"
 if [[ ! -s "$RESTORED" ]]; then
   echo "[3/4] SeedVR2 temporal restoration ($MODEL, ${RESOLUTION}px short side)"
   rm -f "$RESTORED_PART"
-  COMPILE_ARGS=()
-  if [[ "$COMPILE" == 1 ]]; then
-    COMPILE_ARGS=(--compile_vae --cache_vae)
-  fi
   set +e
   # Deterministic container name so the worker can stop/remove this GPU
   # container on abnormal exit (systemd stop, crash) instead of orphaning
