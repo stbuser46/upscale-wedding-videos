@@ -12,6 +12,13 @@ ExecStartPre=/bin/sh -c 'until docker info >/dev/null 2>&1; do echo "waiting for
 # SKIP_BASELINE=1 omits the throwaway non-AI comparison encode (~30 CPU-min/GPU-
 # idle per chapter). The worker forwards its environment to pipeline_v3.sh.
 Environment=SKIP_BASELINE=1
+# Durable-unit restoration: pausable/resumable/yieldable per 750-frame unit.
+Environment=WEDDING_DURABLE_UNITS=1
+# Idle gate: only start/continue when the GPU is free of foreign workloads, and
+# auto-yield between units when one returns (non-interfering). Dwell shortened
+# from the 600s default for canary responsiveness; raise for steadier operation.
+Environment=WEDDING_IDLE_GATE=1
+Environment=WEDDING_IDLE_START_DWELL_S=120
 ExecStart=/home/yacoob/Projects/upscale-wedding-videos/webapp/.venv/bin/python -m webapp.worker.runner
 # The worker exits 0 on SIGTERM (releasing the GPU); restart only on crash.
 Restart=on-failure
