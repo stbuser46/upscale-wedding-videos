@@ -15,10 +15,11 @@ Environment=SKIP_BASELINE=1
 # Durable-unit restoration: pausable/resumable/yieldable per 750-frame unit.
 Environment=WEDDING_DURABLE_UNITS=1
 # Idle gate: only start/continue when the GPU is free of foreign workloads, and
-# auto-yield between units when one returns (non-interfering). Dwell shortened
-# from the 600s default for canary responsiveness; raise for steadier operation.
+# auto-yield between units when one returns (non-interfering). 600s dwell = the
+# GPU must be continuously free for 10 min before restoration starts, so it
+# never jumps on a brief lull in your day-to-day use.
 Environment=WEDDING_IDLE_GATE=1
-Environment=WEDDING_IDLE_START_DWELL_S=120
+Environment=WEDDING_IDLE_START_DWELL_S=600
 ExecStart=/home/yacoob/Projects/upscale-wedding-videos/webapp/.venv/bin/python -m webapp.worker.runner
 # The worker exits 0 on SIGTERM (releasing the GPU); restart only on crash.
 Restart=on-failure
