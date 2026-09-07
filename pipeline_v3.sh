@@ -20,6 +20,17 @@ DUR=$3
 OUT=$4
 TAG=${5:-v3}
 IMAGE=${SEEDVR2_IMAGE:-seedvr2-cuda:v3}
+# Cap container RAM (and forbid swap growth) so a runaway restoration process is
+# OOM-killed inside its own cgroup instead of exhausting host memory and freezing
+# the whole machine — a SeedVR2 process spiked to ~144 GiB and froze the box on
+# 2026-09-07. Normal units use ~9 GiB; 64g leaves generous headroom well under
+# the host total. Override with SEEDVR2_MEM_LIMIT (e.g. 96g) if a unit ever needs
+# more; setting it empty disables the cap.
+MEM_LIMIT=${SEEDVR2_MEM_LIMIT-64g}
+MEM_ARGS=()
+if [[ -n "$MEM_LIMIT" ]]; then
+  MEM_ARGS=(--memory="$MEM_LIMIT" --memory-swap="$MEM_LIMIT")
+fi
 MODEL=${SEEDVR2_MODEL:-seedvr2_ema_3b_fp16.safetensors}
 RESOLUTION=${SEEDVR2_RESOLUTION:-1440}
 BATCH=${SEEDVR2_BATCH:-129}
@@ -206,6 +217,7 @@ if [[ -n "${UNIT_OUTPUT:-}" ]]; then
   docker rm -f "$RESTORE_CONTAINER" >/dev/null 2>&1 || true
   set +e
   docker run --rm --name "$RESTORE_CONTAINER" --gpus all --ipc=host \
+    ${MEM_ARGS[@]+"${MEM_ARGS[@]}"} \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "${PROJECT_MOUNTS[@]}" \
@@ -271,6 +283,7 @@ if [[ ! -s "$RESTORED" ]]; then
   RESTORE_CONTAINER="wedding-${TAG}"
   docker rm -f "$RESTORE_CONTAINER" >/dev/null 2>&1 || true
   docker run --rm --name "$RESTORE_CONTAINER" --gpus all --ipc=host \
+    ${MEM_ARGS[@]+"${MEM_ARGS[@]}"} \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "${PROJECT_MOUNTS[@]}" \
