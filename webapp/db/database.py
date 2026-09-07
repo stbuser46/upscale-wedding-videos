@@ -53,10 +53,25 @@ def retry_db(
             delay = min(max_delay, delay * 2)
 
 
+class _AutoCloseConnection(sqlite3.Connection):
+    """sqlite3's context manager commits/rolls back on ``__exit__`` but does NOT
+    close the connection — so ``with connect() as db:`` leaks the underlying file
+    descriptors (catalog.sqlite + -wal + -shm). Under the worker's high
+    connection churn (heartbeats, per-second state checks) those pile up until
+    the process hits its fd limit and every open fails with "unable to open
+    database file". Closing here releases the fds on every ``with`` exit."""
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def connect(database_path: Path | str) -> sqlite3.Connection:
     path = Path(database_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=30, isolation_level=None)
+    connection = sqlite3.connect(path, timeout=30, isolation_level=None, factory=_AutoCloseConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA journal_mode = WAL")

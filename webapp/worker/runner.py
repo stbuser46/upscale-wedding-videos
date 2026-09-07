@@ -741,6 +741,7 @@ def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path
                 return STATUS_SHUTDOWN
             return status
         finally:
+            selector.close()
             if process.poll() is None:
                 _stop_container(_container_name(job["public_id"]))
                 process.terminate()
