@@ -276,6 +276,9 @@ async function loadJob() {
 const METRIC_SERIES = [
   {key: "gpu_pct", label: "GPU", color: "#1baf7a"},
   {key: "cpu_pct", label: "CPU", color: "#2a78d6"},
+  // GPU temperature in °C, plotted on the shared 0–100 axis (GPU temps live in
+  // that range; the throttle threshold ~85 reads near the top). Warm colour.
+  {key: "gpu_temp_c", label: "Temp°C", color: "#d1663a"},
 ];
 let metricsMinutes = 60;
 let metricsSamples = [];

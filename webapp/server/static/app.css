@@ -183,6 +183,7 @@ dl dd { margin: 5px 0 0; overflow-wrap: anywhere; }
 .legend-dot { width: 9px; height: 9px; border-radius: 50%; }
 .legend-dot.gpu { background: #1baf7a; }
 .legend-dot.cpu { background: #2a78d6; }
+.legend-dot.temp { background: #d1663a; }
 .metrics-updated { margin-left: auto; font-size: 12px; }
 
 /* Restoration status (library + title pages) */
