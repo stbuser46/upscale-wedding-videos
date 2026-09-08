@@ -23,10 +23,13 @@ IMAGE=${SEEDVR2_IMAGE:-seedvr2-cuda:v3}
 # Cap container RAM (and forbid swap growth) so a runaway restoration process is
 # OOM-killed inside its own cgroup instead of exhausting host memory and freezing
 # the whole machine — a SeedVR2 process spiked to ~144 GiB and froze the box on
-# 2026-09-07. Normal units use ~9 GiB; 64g leaves generous headroom well under
-# the host total. Override with SEEDVR2_MEM_LIMIT (e.g. 96g) if a unit ever needs
-# more; setting it empty disables the cap.
-MEM_LIMIT=${SEEDVR2_MEM_LIMIT-64g}
+# 2026-09-07. Measured reality: a durable unit's frame-writing step peaks around
+# ~63 GiB for a 750-frame unit (it holds the full 1440p output in RAM to encode),
+# so a 64g cap was too tight and OOM-killed legitimate units. 110g comfortably
+# fits real units while still leaving ~72 GiB host headroom to prevent a freeze
+# (the idle gate keeps other GPU/RAM users away while we run). Override with
+# SEEDVR2_MEM_LIMIT; set it empty to disable the cap.
+MEM_LIMIT=${SEEDVR2_MEM_LIMIT-110g}
 MEM_ARGS=()
 if [[ -n "$MEM_LIMIT" ]]; then
   MEM_ARGS=(--memory="$MEM_LIMIT" --memory-swap="$MEM_LIMIT")
