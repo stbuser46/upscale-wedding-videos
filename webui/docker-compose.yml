@@ -1,0 +1,19 @@
+# Wedding upscale picker web UI.
+#
+# SECURITY 2026-08-14: the live container was previously started with a bare
+# `docker run -p 8092:8092` (== 0.0.0.0), exposing this Flask **dev server** to
+# the whole LAN with no authentication. It was recreated bound to loopback only.
+# The host ufw firewall does NOT cover Docker publishes (Docker's iptables rules
+# run before ufw's INPUT chain), so binding must be scoped here, not in ufw.
+#
+# This compose file documents/reproduces the corrected container. Access it over
+# the tailnet (tailscale serve/funnel) or an SSH tunnel — do not re-publish 0.0.0.0.
+services:
+  wedding-webui:
+    image: wedding-webui:latest
+    container_name: wedding-webui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8092:8092"   # loopback only (was 8092:8092 == 0.0.0.0)
+    volumes:
+      - /home/yacoob/Projects/upscale-wedding-videos/webui/data:/data
