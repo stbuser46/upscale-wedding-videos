@@ -185,6 +185,30 @@ and leaks VRAM until multi-chunk jobs OOM; see
 `docs/COMPILE_LEAK_INVESTIGATION.md` and the acceptance tests in `scripts/`.
 `SEEDVR2_COMPILE=0` restores the original uncompiled behaviour exactly.
 
+### 2026-09-08 update: persistent compile cache across containers
+
+Durable-unit production runs (the webapp worker's default) launch one
+`--rm` SeedVR2 container per ~750-frame unit, and each container was paying
+the full VAE compile again: measured on a live chapter, ~186 s of every
+~1,008 s unit (encode batch 1 ~150 s vs ~30 s steady; decode batch 1 ~143 s
+vs ~78 s), dragging effective throughput back down to ~0.74 output fps.
+
+`pipeline_v3.sh` now mounts a persistent Inductor/Triton cache
+(`$WORK_ROOT/.inductor_cache`, override or disable with
+`SEEDVR2_INDUCTOR_CACHE`) into both SeedVR2 invocations via
+`TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR`. The first unit populates it at
+the old speed; every later unit starts warm. Measured in production
+(DVD2 chapter 7, units 29→30): encode phase 304.7 s → 192.6 s, decode
+526.2 s → 465.6 s, ~0.88 output fps sustained — roughly 15–18% more restored
+footage per GPU window, ~2–3 minutes saved per unit.
+
+The cache is keyed by torch version, graph, and tensor shapes, so a hit
+replays the identical compiled kernels; a miss compiles exactly as before and
+saves the result. Run-to-run determinism of the pipeline was proven
+byte-identical on 2026-08-30; a formal cold-versus-warm decoded-hash
+comparison is staged in `work/verifycache/` and still pending a free GPU
+window.
+
 ## Output inventory
 
 Important files in `out/`:

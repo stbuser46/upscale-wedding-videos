@@ -13,6 +13,10 @@ not a factual recovery of detail that was never recorded.
   [setup and operations guide](webapp/README.md).
 - [`docs/CURRENT_PIPELINE.md`](docs/CURRENT_PIPELINE.md) records media analysis,
   pinned settings, validation, performance, and known pipeline limitations.
+- [`docs/IDLE_PAUSE_RESUME_PLAN.md`](docs/IDLE_PAUSE_RESUME_PLAN.md) is the
+  design for durable pause/resume, idle-only scheduling, automatic backlog
+  processing, and safe GPU hand-off on the homeserver (now implemented; the
+  document's references to "the NAS" predate the move to the homeserver).
 - [`docs/WEB_UI_SPEC.md`](docs/WEB_UI_SPEC.md) is the authoritative product and
   data-model specification.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) maps implemented phases to the

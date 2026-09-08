@@ -111,6 +111,24 @@ The restored result is byte-identical; only the throwaway comparison file is
 omitted. A worker restart is required to change this, and is cheapest to do
 while the current job is still in its restore warm-up (zero frames done).
 
+### Progress, ETA, and worker health during durable-unit runs
+
+In durable-unit mode the frame counter advances in whole-unit steps (750
+frames) each time a unit is validated on disk — it is a count of frames that
+are safely restored, not a live tail of the GPU. The job's fps and ETA are
+recomputed from measured unit throughput after every unit; a new run seeds a
+conservative ETA (0.71 fps planning rate) as soon as its first unit starts, so
+the queue never shows "ETA pending" for a running durable job.
+
+On resume, the worker re-probes every previously completed unit (one
+containerized ffprobe each) before restoring anything new. It heartbeats
+through that loop with a "validating unit N/M" detail, so a long resume shows
+as working in the header pill instead of falsely reporting the worker down.
+
+Stage 3 also persists its torch.compile cache across unit containers (see
+`docs/CURRENT_PIPELINE.md`, 2026-09-08 update), which removes ~2–3 minutes of
+recompilation per unit.
+
 ### Library and queue status
 
 The library and per-DVD pages mark which chapters are already restored (a green

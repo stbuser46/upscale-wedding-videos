@@ -76,6 +76,27 @@ case "$WORK_ROOT" in
   "$PROJ"/*) ;;
   *) echo "PIPELINE_WORK_ROOT must be inside the project: $WORK_ROOT" >&2; exit 2 ;;
 esac
+
+# Persist torch.compile (Inductor/Triton) kernels across SeedVR2 containers.
+# Durable-unit mode launches one --rm container per unit; without a persistent
+# cache every unit recompiles the VAE encoder+decoder from scratch (~186 s of a
+# ~1,008 s unit — measured 2026-09-08 on restore-26693a6c4309: encode batch 1
+# ~150 s vs ~30 s steady, decode batch 1 ~143 s vs ~78 s; warm-cache A/B showed
+# encode 72 s vs 189 s cold). The cache is keyed by torch version + graph +
+# shapes, so a hit replays identical kernels; a miss compiles exactly as before
+# and saves for next time. Override the location with SEEDVR2_INDUCTOR_CACHE;
+# set it empty to disable persistence.
+INDUCTOR_CACHE=${SEEDVR2_INDUCTOR_CACHE-$WORK_ROOT/.inductor_cache}
+CACHE_ARGS=()
+if [[ -n "$INDUCTOR_CACHE" ]]; then
+  case "$INDUCTOR_CACHE" in
+    "$PROJ"/*) ;;
+    *) echo "SEEDVR2_INDUCTOR_CACHE must be inside the project: $INDUCTOR_CACHE" >&2; exit 2 ;;
+  esac
+  mkdir -p "$INDUCTOR_CACHE"
+  CACHE_ARGS=(-e TORCHINDUCTOR_CACHE_DIR="/proj/${INDUCTOR_CACHE#"$PROJ/"}"
+              -e TRITON_CACHE_DIR="/proj/${INDUCTOR_CACHE#"$PROJ/"}/triton")
+fi
 case "$INPUT" in
   "$PROJ"/*) ;;
   *) echo "Input must be inside the project: $INPUT" >&2; exit 2 ;;
@@ -223,6 +244,7 @@ if [[ -n "${UNIT_OUTPUT:-}" ]]; then
     ${MEM_ARGS[@]+"${MEM_ARGS[@]}"} \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
     "${PROJECT_MOUNTS[@]}" \
     "$IMAGE" \
     "/proj/${DEINTERLACED#"$PROJ/"}" \
@@ -289,6 +311,7 @@ if [[ ! -s "$RESTORED" ]]; then
     ${MEM_ARGS[@]+"${MEM_ARGS[@]}"} \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
     "${PROJECT_MOUNTS[@]}" \
     "$IMAGE" \
     "/proj/${DEINTERLACED#"$PROJ/"}" \

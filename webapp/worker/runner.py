@@ -691,14 +691,38 @@ def _pause_job(settings: Settings, job_id: int) -> None:
     retry_db(op, attempts=5, base_delay=0.3)
 
 
-def _units_frames_done(settings: Settings, job_id: int) -> None:
+def _units_frames_done(settings: Settings, job_id: int) -> int | None:
+    total: int | None = None
+
     def op() -> None:
+        nonlocal total
         with connect(settings.database_path) as db, transaction(db):
             total = db.execute(
                 "SELECT COALESCE(SUM(frame_count), 0) FROM job_chunks WHERE job_id=? AND state='valid'",
                 (job_id,),
             ).fetchone()[0]
             db.execute("UPDATE jobs SET frames_done=?, updated_at=? WHERE id=?", (total, utc_now(), job_id))
+    _best_effort(op)
+    return total
+
+
+def _unit_progress(settings: Settings, job, frames_done: int, run_started: float, frames_at_start: int) -> None:
+    """Refresh fps/elapsed/ETA from durable-unit throughput. The line-parsing
+    progress updates in _run_pipeline only serve the legacy monolithic path,
+    so without this a durable job shows "ETA pending" for its whole run. Uses
+    the 0.71 fps planning rate until the first unit of this run completes."""
+    elapsed = time.monotonic() - run_started
+    produced = frames_done - frames_at_start
+    fps = produced / elapsed if produced > 0 and elapsed > 0 else None
+    remaining = max(0, job["frames_total"] - frames_done)
+    eta = remaining / fps if fps else remaining / 0.71
+
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            db.execute(
+                "UPDATE jobs SET fps=?, elapsed_seconds=?, eta_seconds=?, updated_at=? WHERE id=?",
+                (round(fps, 3) if fps else None, round(elapsed, 1), round(eta, 1), utc_now(), job["id"]),
+            )
     _best_effort(op)
 
 
@@ -806,6 +830,8 @@ def _run_units(settings: Settings, job) -> int:
     idle_gate_on = os.environ.get("WEDDING_IDLE_GATE") == "1"
     idle_policy = IdlePolicy.from_env()
     _set_state(settings, job["id"], "running", "seedvr2_restore")
+    run_started: float | None = None
+    frames_at_start = 0
 
     for unit in units:
         if _SHUTDOWN:
@@ -825,9 +851,21 @@ def _run_units(settings: Settings, job) -> int:
                 _yield_job(settings, job["id"], reason)
                 return STATUS_YIELDED
         unit_path = units_dir / f"unit_{unit['seq']:05d}.mkv"
+        # Beat while re-validating resumed units: each probe is a docker-run
+        # ffprobe (~5-8 s), so a long resume otherwise goes silent for minutes
+        # and the UI pill falsely reports the worker down (90 s threshold).
+        _heartbeat(settings, "running", active_job_id=job["id"],
+                   detail=f"validating unit {unit['seq'] + 1}/{len(units)}")
         if _chunk_valid(settings, job["id"], unit, unit_path):
             _units_frames_done(settings, job["id"])
             continue
+        if run_started is None:
+            # First unit this run actually executes: measure throughput from
+            # here (skipped-valid units would otherwise inflate the rate) and
+            # seed a fallback ETA so the UI never sits on "ETA pending".
+            run_started = time.monotonic()
+            frames_at_start = _units_frames_done(settings, job["id"]) or 0
+            _unit_progress(settings, job, frames_at_start, run_started, frames_at_start)
         detail = f"unit {unit['seq'] + 1}/{len(units)}"
         _record_chunk(settings, job["id"], unit, unit_path, "running")
         _heartbeat(settings, "running", active_job_id=job["id"], detail=detail)
@@ -847,7 +885,9 @@ def _run_units(settings: Settings, job) -> int:
             _record_chunk(settings, job["id"], unit, unit_path, "invalid")
             raise WorkerError(f"Unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
         _record_chunk(settings, job["id"], unit, unit_path, "valid", frame_count=actual)
-        _units_frames_done(settings, job["id"])
+        done = _units_frames_done(settings, job["id"])
+        if done is not None and run_started is not None:
+            _unit_progress(settings, job, done, run_started, frames_at_start)
 
     if _SHUTDOWN:
         return STATUS_SHUTDOWN
