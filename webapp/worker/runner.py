@@ -702,10 +702,15 @@ def _units_frames_done(settings: Settings, job_id: int) -> None:
     _best_effort(op)
 
 
-def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path: Path) -> int:
+def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path: Path,
+                heartbeat_detail: str | None = None) -> int:
     """Run a child process, tee its output to the job log, and honour shutdown
-    (release the GPU) and cooperative cancel between the pipeline's stages."""
+    (release the GPU) and cooperative cancel between the pipeline's stages. Beats
+    the worker heartbeat periodically so the health signal stays fresh during a
+    unit's long run (a unit takes ~15 min; the UI marks the worker down after 90s
+    without a beat)."""
     control = settings.data_dir / "control" / f"{job['public_id']}.cancel"
+    last_beat = time.monotonic()
     with log_path.open("a", encoding="utf-8", buffering=1) as log:
         process = subprocess.Popen(
             command, cwd=settings.project_root, env=env,
@@ -727,6 +732,9 @@ def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path
                     return STATUS_SHUTDOWN
                 if _job_state(settings, job["id"]) == "cancel_requested":
                     _touch_cancel(control)
+                if time.monotonic() - last_beat >= 20:
+                    _heartbeat(settings, "running", active_job_id=job["id"], detail=heartbeat_detail)
+                    last_beat = time.monotonic()
                 for key, _ in selector.select(timeout=1):
                     line = key.fileobj.readline()
                     if line:
@@ -747,7 +755,8 @@ def _run_logged(settings: Settings, job, command: list[str], env: dict, log_path
                 process.terminate()
 
 
-def _run_unit(settings, job, source, start_sec, duration, unit, unit_path: Path, log_path: Path) -> int:
+def _run_unit(settings, job, source, start_sec, duration, unit, unit_path: Path, log_path: Path,
+              heartbeat_detail: str | None = None) -> int:
     snapshot = json.loads(job["settings_json"])
     env = os.environ.copy()
     env.update(
@@ -761,7 +770,7 @@ def _run_unit(settings, job, source, start_sec, duration, unit, unit_path: Path,
     )
     command = [str(settings.pipeline_path), str(source), f"{start_sec:.3f}", f"{duration:.3f}",
                str(job["output_path"]), job["public_id"]]
-    return _run_logged(settings, job, command, env, log_path)
+    return _run_logged(settings, job, command, env, log_path, heartbeat_detail=heartbeat_detail)
 
 
 def _assemble(settings, job, manifest: Path, source, start_sec, duration, log_path: Path) -> int:
@@ -769,7 +778,7 @@ def _assemble(settings, job, manifest: Path, source, start_sec, duration, log_pa
     env.setdefault("WEBAPP_FFMPEG_IMAGE", "upscaler-cuda:latest")
     command = [str(settings.project_root / "assemble_units.sh"), str(manifest), str(source),
                f"{start_sec:.3f}", f"{duration:.3f}", str(job["output_path"])]
-    return _run_logged(settings, job, command, env, log_path)
+    return _run_logged(settings, job, command, env, log_path, heartbeat_detail="assembling")
 
 
 def _run_units(settings: Settings, job) -> int:
@@ -819,10 +828,12 @@ def _run_units(settings: Settings, job) -> int:
         if _chunk_valid(settings, job["id"], unit, unit_path):
             _units_frames_done(settings, job["id"])
             continue
+        detail = f"unit {unit['seq'] + 1}/{len(units)}"
         _record_chunk(settings, job["id"], unit, unit_path, "running")
-        _heartbeat(settings, "running", active_job_id=job["id"], detail=f"unit {unit['seq'] + 1}/{len(units)}")
+        _heartbeat(settings, "running", active_job_id=job["id"], detail=detail)
         _ACTIVE_CONTAINER = container
-        status = _run_unit(settings, job, source, start_sec, duration, unit, unit_path, log)
+        status = _run_unit(settings, job, source, start_sec, duration, unit, unit_path, log,
+                           heartbeat_detail=detail)
         _ACTIVE_CONTAINER = None
         if status == STATUS_SHUTDOWN or _SHUTDOWN:
             return STATUS_SHUTDOWN
