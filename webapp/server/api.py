@@ -79,7 +79,7 @@ def system_metrics():
     cutoff = datetime.now(UTC) - timedelta(minutes=minutes)
     with _db() as db:
         rows = db.execute(
-            "SELECT ts, cpu_pct, mem_pct, gpu_pct, gpu_mem_mib, gpu_power_w "
+            "SELECT ts, cpu_pct, mem_pct, gpu_pct, gpu_mem_mib, gpu_power_w, gpu_temp_c "
             "FROM system_metrics WHERE ts >= ? ORDER BY ts",
             (cutoff.isoformat(timespec="milliseconds"),),
         ).fetchall()
@@ -102,6 +102,7 @@ def system_metrics():
                 "gpu_pct": bucket_mean(chunk, "gpu_pct"),
                 "gpu_mem_mib": bucket_mean(chunk, "gpu_mem_mib"),
                 "gpu_power_w": bucket_mean(chunk, "gpu_power_w"),
+                "gpu_temp_c": bucket_mean(chunk, "gpu_temp_c"),
             })
         rows = sampled
     else:

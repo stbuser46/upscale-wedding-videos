@@ -346,6 +346,7 @@ function metricsTiles() {
     ["CPU", `${Math.round(latest.cpu_pct)}%`],
     ["VRAM", latest.gpu_mem_mib === null ? "—" : `${(latest.gpu_mem_mib / 1024).toFixed(1)} GiB`],
     ["GPU power", latest.gpu_power_w === null ? "—" : `${Math.round(latest.gpu_power_w)} W`],
+    ["GPU temp", latest.gpu_temp_c === null || latest.gpu_temp_c === undefined ? "—" : `${Math.round(latest.gpu_temp_c)}°C`],
     ["RAM", `${Math.round(latest.mem_pct)}%`],
   ];
   for (const [label, value] of tiles) {
@@ -372,7 +373,8 @@ function metricsHover(event) {
   const when = new Date(Date.parse(nearest.ts)).toLocaleTimeString();
   const gpu = nearest.gpu_pct === null ? "n/a" : `${Math.round(nearest.gpu_pct)}%`;
   const vram = nearest.gpu_mem_mib === null ? "n/a" : `${(nearest.gpu_mem_mib / 1024).toFixed(1)} GiB`;
-  tooltip.textContent = `${when} · GPU ${gpu} · CPU ${Math.round(nearest.cpu_pct)}% · VRAM ${vram}`;
+  const temp = nearest.gpu_temp_c === null || nearest.gpu_temp_c === undefined ? "n/a" : `${Math.round(nearest.gpu_temp_c)}°C`;
+  tooltip.textContent = `${when} · GPU ${gpu} · CPU ${Math.round(nearest.cpu_pct)}% · VRAM ${vram} · ${temp}`;
   tooltip.classList.remove("hidden");
   tooltip.style.left = `${Math.min(rect.width - 220, Math.max(0, event.clientX - rect.left - 110))}px`;
 }

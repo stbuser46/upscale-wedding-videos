@@ -44,15 +44,15 @@ def _read_mem_pct() -> float:
     return round(100.0 * (total - values.get("MemAvailable", 0)) / total, 1)
 
 
-def _read_gpu() -> tuple[float, int, float] | None:
+def _read_gpu() -> tuple[float, int, float, float] | None:
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,power.draw",
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,power.draw,temperature.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=4, check=True,
         )
-        util, mem, power = (part.strip() for part in result.stdout.splitlines()[0].split(","))
-        return float(util), int(float(mem)), float(power)
+        util, mem, power, temp = (part.strip() for part in result.stdout.splitlines()[0].split(","))
+        return float(util), int(float(mem)), float(power), float(temp)
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
 
@@ -69,10 +69,11 @@ def _sample_loop(settings: Settings, stop: threading.Event) -> None:
         try:
             with connect(settings.database_path) as db:
                 db.execute(
-                    "INSERT INTO system_metrics (ts, cpu_pct, mem_pct, gpu_pct, gpu_mem_mib, gpu_power_w) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO system_metrics (ts, cpu_pct, mem_pct, gpu_pct, gpu_mem_mib, gpu_power_w, gpu_temp_c) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (utc_now(), cpu_pct, _read_mem_pct(),
-                     gpu[0] if gpu else None, gpu[1] if gpu else None, gpu[2] if gpu else None),
+                     gpu[0] if gpu else None, gpu[1] if gpu else None,
+                     gpu[2] if gpu else None, gpu[3] if gpu else None),
                 )
                 samples_since_prune += 1
                 if samples_since_prune >= _PRUNE_EVERY_SAMPLES:
