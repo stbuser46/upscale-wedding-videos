@@ -118,7 +118,10 @@ frames) each time a unit is validated on disk — it is a count of frames that
 are safely restored, not a live tail of the GPU. The job's fps and ETA are
 recomputed from measured unit throughput after every unit; a new run seeds a
 conservative ETA (0.71 fps planning rate) as soon as its first unit starts, so
-the queue never shows "ETA pending" for a running durable job.
+the queue never shows "ETA pending" for a running durable job. Jobs that have
+not started yet show "Est. restore ~H:MM" instead — the remaining frames at
+the measured planning rate (`PLANNING_FPS` in `webapp/server/services.py`) —
+so the GPU cost of each queued chapter is visible before it runs.
 
 On resume, the worker re-probes every previously completed unit (one
 containerized ffprobe each) before restoring anything new. It heartbeats

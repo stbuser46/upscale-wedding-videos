@@ -206,7 +206,10 @@ function queueCard(job) {
   const heading = el("h2"); const link = el("a", "", job.display_name); link.href = `/jobs/${job.public_id}`; heading.append(link); identity.append(heading, el("div", "queue-source", `${job.disc_slug.toUpperCase()} · title ${job.title_number} · ${formatTime(job.source_start_ms)}–${formatTime(job.source_end_ms)}`));
   const stage = el("div"); stage.append(el("p", "eyebrow", "Current stage"), el("strong", "", job.stage || (job.start_requested ? "Awaiting worker" : "Not started")), el("div", "queue-source", `${job.frames_done.toLocaleString()} / ${job.frames_total.toLocaleString()} frames`));
   const progress = el("div"); const track = el("progress", "progress-native"); track.max = 100; track.value = Math.min(100, job.progress_percent);
-  const meta = el("div", "progress-meta"); meta.append(el("span", "", `${job.progress_percent}%`), el("span", "", job.eta_seconds ? `ETA ${formatTime(job.eta_seconds * 1000)}` : "ETA pending")); progress.append(track, meta);
+  const etaText = job.eta_seconds ? `ETA ${formatTime(job.eta_seconds * 1000)}`
+    : job.estimated_restore_seconds ? `Est. restore ~${formatTime(job.estimated_restore_seconds * 1000)}`
+    : "ETA pending";
+  const meta = el("div", "progress-meta"); meta.append(el("span", "", `${job.progress_percent}%`), el("span", "", etaText)); progress.append(track, meta);
   const actions = el("div", "queue-actions");
   const action = (label, method, path, body, cls="button small") => { const button = el("button", cls, label); button.addEventListener("click", async () => { button.disabled = true; try { await api(path, {method, body}); await loadQueue(); } catch (error) { notify(error.message, true); button.disabled = false; } }); actions.append(button); };
   if (job.can_start) action("Start", "POST", `/api/jobs/${job.public_id}/start`);
@@ -262,7 +265,7 @@ async function loadJob() {
     document.getElementById("job-name").textContent = job.display_name;
     document.getElementById("job-source").textContent = `${job.disc_slug.toUpperCase()} · title ${job.title_number} · ${formatTime(job.source_start_ms)}–${formatTime(job.source_end_ms)} (${formatTime(job.duration_ms)})`;
     const summary = el("div", "summary-card");
-    for (const [label,value] of [["State",job.state.replaceAll("_"," ")],["Stage",job.stage||"Not started"],["Progress",`${job.progress_percent}%`],["Elapsed",formatTime(job.elapsed_seconds*1000)],["ETA",job.eta_seconds?formatTime(job.eta_seconds*1000):"Pending"]]) { const cell=el("div"); cell.append(el("span","",label),el("strong","",value)); summary.append(cell); }
+    for (const [label,value] of [["State",job.state.replaceAll("_"," ")],["Stage",job.stage||"Not started"],["Progress",`${job.progress_percent}%`],["Elapsed",formatTime(job.elapsed_seconds*1000)],["ETA",job.eta_seconds?formatTime(job.eta_seconds*1000):(job.estimated_restore_seconds?`~${formatTime(job.estimated_restore_seconds*1000)} (est.)`:"Pending")]]) { const cell=el("div"); cell.append(el("span","",label),el("strong","",value)); summary.append(cell); }
     document.getElementById("job-summary").replaceChildren(summary);
     const settings = document.getElementById("job-settings"); settings.replaceChildren();
     for (const [key,value] of Object.entries(job.settings)) { settings.append(el("dt","",key.replaceAll("_"," ")),el("dd","",String(value))); }

@@ -136,6 +136,13 @@ def event_dict(row: sqlite3.Row) -> dict[str, Any]:
     return result
 
 
+# Planning rate for jobs that have not produced a measured ETA yet: sustained
+# durable-unit throughput with the persistent compile cache (measured 0.88-0.90
+# output fps, 2026-09-09). Once a job runs, the worker's measured rate replaces
+# estimates derived from this.
+PLANNING_FPS = 0.9
+
+
 def job_dict(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result["settings"] = json.loads(result.pop("settings_json"))
@@ -146,6 +153,14 @@ def job_dict(row: sqlite3.Row) -> dict[str, Any]:
         if result["frames_total"]
         else 0
     )
+    # Queued/paused jobs have no live ETA; give the UI a planning estimate for
+    # the remaining GPU work so cards never sit on a bare "ETA pending".
+    if not result.get("eta_seconds") and result["frames_total"]:
+        remaining = max(0, result["frames_total"] - result["frames_done"])
+        # Rounded to whole minutes: it is a planning estimate, not a countdown.
+        result["estimated_restore_seconds"] = round(remaining / PLANNING_FPS / 60) * 60
+    else:
+        result["estimated_restore_seconds"] = None
     result["can_start"] = result["state"] == "queued" and not result["start_requested"]
     result["can_cancel"] = result["state"] in {
         "queued", "preparing", "running", "assembling", "cancel_requested"
