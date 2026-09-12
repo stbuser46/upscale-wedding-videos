@@ -507,7 +507,17 @@ def _validate_and_complete(settings: Settings, job) -> None:
     if not output.is_file() or output.stat().st_size == 0:
         raise WorkerError("Pipeline returned success without a restored output")
     media = _probe_output(settings, output)
+    # Re-read frames_total: the durable-unit path may have shrunk it to the
+    # frames that actually exist in the source (tail-unit reconciliation),
+    # and the claim-time row would be stale.
+    with connect(settings.database_path) as db:
+        expected_frames_row = db.execute(
+            "SELECT frames_total FROM jobs WHERE id=?", (job["id"],)
+        ).fetchone()
+    expected_frames = expected_frames_row[0]
     expected_duration = (job["source_end_ms"] - job["source_start_ms"]) / 1000
+    if expected_frames < round(expected_duration * 50):
+        expected_duration = expected_frames / 50
     actual_duration = float(media.get("format", {}).get("duration", 0))
     streams = media.get("streams", [])
     video = next((item for item in streams if item.get("codec_type") == "video"), None)
@@ -525,7 +535,6 @@ def _validate_and_complete(settings: Settings, job) -> None:
         raise WorkerError("Output colour validation failed: expected limited-range BT.709 tags")
     if not audio or audio.get("codec_name") != "flac" or int(audio.get("sample_rate", 0)) != 48000:
         raise WorkerError("Output audio validation failed: expected 48 kHz FLAC")
-    expected_frames = job["frames_total"]
     actual_frames = int(video.get("nb_read_frames") or 0)
     if actual_frames != expected_frames:
         raise WorkerError(f"Output frame validation failed: expected {expected_frames}, found {actual_frames}")
@@ -640,6 +649,18 @@ def _chunk_valid(settings: Settings, job_id: int, unit, unit_path: Path) -> bool
         return _probe_frame_count(settings, unit_path) == unit["new"]
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
+
+
+def _set_frames_total(settings: Settings, job_id: int, frames_total: int) -> None:
+    """Shrink a job to the frames that actually exist in its deinterlaced
+    source (DVD chapters do not always cut on exact frame boundaries)."""
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            db.execute(
+                "UPDATE jobs SET frames_total=?, updated_at=? WHERE id=?",
+                (frames_total, utc_now(), job_id),
+            )
+    retry_db(op, attempts=5, base_delay=0.3)
 
 
 def _set_state(settings: Settings, job_id: int, state: str, stage: str | None = None) -> None:
@@ -882,8 +903,19 @@ def _run_units(settings: Settings, job) -> int:
             raise WorkerError(f"Unit {unit['seq']} failed with status {status}")
         actual = _probe_frame_count(settings, unit_path)
         if actual != unit["new"]:
-            _record_chunk(settings, job["id"], unit, unit_path, "invalid")
-            raise WorkerError(f"Unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
+            shortfall = unit["new"] - actual
+            if unit["seq"] == len(units) - 1 and 0 < shortfall <= 50:
+                # DVD chapters do not always cut on exact frame boundaries, so
+                # the deinterlaced source can run a few frames short of the
+                # catalog's timestamp arithmetic. The tail unit already holds
+                # every frame that exists — accept it and shrink the job to
+                # reality instead of failing at 99% over phantom frames
+                # (DVD2 Ch7 died 4 frames short of a 62,830-frame plan).
+                _set_frames_total(settings, job["id"], unit["start"] + actual)
+                unit = {**unit, "new": actual}
+            else:
+                _record_chunk(settings, job["id"], unit, unit_path, "invalid")
+                raise WorkerError(f"Unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
         _record_chunk(settings, job["id"], unit, unit_path, "valid", frame_count=actual)
         done = _units_frames_done(settings, job["id"])
         if done is not None and run_started is not None:

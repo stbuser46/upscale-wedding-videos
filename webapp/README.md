@@ -128,6 +128,12 @@ containerized ffprobe each) before restoring anything new. It heartbeats
 through that loop with a "validating unit N/M" detail, so a long resume shows
 as working in the header pill instead of falsely reporting the worker down.
 
+DVD chapters do not always cut on exact frame boundaries, so a chapter's
+deinterlaced source can hold a few frames fewer than the catalog's timestamp
+arithmetic predicts. If the final unit comes up short by 50 frames or less,
+the worker accepts the frames that actually exist and shrinks the job's frame
+total to match, rather than failing the whole chapter at 99%.
+
 Stage 3 also persists its torch.compile cache across unit containers (see
 `docs/CURRENT_PIPELINE.md`, 2026-09-08 update), which removes ~2–3 minutes of
 recompilation per unit.
