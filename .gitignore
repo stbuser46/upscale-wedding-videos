@@ -12,6 +12,15 @@ webapp/data/
 *.mp4
 *.flac
 
+# Secrets — belt and braces; webapp/data/ is already ignored wholesale above
+*.env
+!.env.example
+*_api_key
+*apikey*
+*api-key*
+*api_key*
+cloud/keys/
+
 # Runtime
 *.log
 *.partial

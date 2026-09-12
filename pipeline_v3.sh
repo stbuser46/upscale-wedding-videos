@@ -14,6 +14,8 @@ if (( $# < 4 || $# > 5 )); then
 fi
 
 PROJ=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Pinned SeedVR2 unit argv, shared with the cloud executor (no fork).
+source "$PROJ/lib/seedvr2_unit_args.sh"
 IN=$1
 SS=$2
 DUR=$3
@@ -236,6 +238,13 @@ if [[ -n "${UNIT_OUTPUT:-}" ]]; then
     exit 0
   fi
   echo "[unit] skip=$UNIT_SKIP cap=$UNIT_LOAD_CAP prepend=$UNIT_PREPEND drop=$UNIT_DROP -> $UOUT"
+  seedvr2_unit_args \
+    "/proj/${DEINTERLACED#"$PROJ/"}" \
+    "/proj/${UOUT_PART#"$PROJ/"}" \
+    /proj/models/seedvr2 \
+    "$MODEL" "$RESOLUTION" "$BATCH" "$OVERLAP" \
+    "$UNIT_SKIP" "$UNIT_LOAD_CAP" "$UNIT_PREPEND" "$UNIT_DROP" \
+    ${COMPILE_ARGS[@]+"${COMPILE_ARGS[@]}"}
   rm -f "$UOUT_PART"
   RESTORE_CONTAINER="wedding-${TAG}"
   docker rm -f "$RESTORE_CONTAINER" >/dev/null 2>&1 || true
@@ -247,19 +256,7 @@ if [[ -n "${UNIT_OUTPUT:-}" ]]; then
     ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
     "${PROJECT_MOUNTS[@]}" \
     "$IMAGE" \
-    "/proj/${DEINTERLACED#"$PROJ/"}" \
-    --output "/proj/${UOUT_PART#"$PROJ/"}" \
-    --model_dir /proj/models/seedvr2 \
-    --dit_model "$MODEL" \
-    --resolution "$RESOLUTION" \
-    --batch_size "$BATCH" --uniform_batch_size \
-    --chunk_size 0 --temporal_overlap "$OVERLAP" \
-    --skip_first_frames "$UNIT_SKIP" --load_cap "$UNIT_LOAD_CAP" \
-    --prepend_frames "$UNIT_PREPEND" --drop_leading "$UNIT_DROP" \
-    --color_correction lab \
-    --vae_encode_tiled --vae_decode_tiled \
-    --video_backend ffmpeg --10bit --debug \
-    ${COMPILE_ARGS[@]+"${COMPILE_ARGS[@]}"} 2>&1 | tee "$LOG"
+    "${SEEDVR2_UNIT_ARGV[@]}" 2>&1 | tee "$LOG"
   unit_status=${PIPESTATUS[0]}
   set -e
   if (( unit_status != 0 )); then
