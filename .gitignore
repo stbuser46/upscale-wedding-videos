@@ -21,6 +21,9 @@ webapp/data/
 *api_key*
 cloud/keys/
 
+# Local tooling state (Claude Code settings + agent worktrees)
+.claude/
+
 # Runtime
 *.log
 *.partial
