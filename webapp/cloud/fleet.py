@@ -80,7 +80,15 @@ class CloudFleet:
     def _ledger(self, pod_name: str, **fields) -> None:
         cols = ", ".join(f"{k}=:{k}" for k in fields)
         with connect(self.settings.database_path) as db:
-            db.execute(f"UPDATE cloud_pods SET {cols} WHERE name=:name",
+            # Only ever touch this run's live row. Pod names repeat across runs
+            # (wedding-<public_id>-<index>) and rows are never deleted, so a bare
+            # WHERE name=:name would also match a prior attempt's terminated row
+            # and drive both to the same pod_id -> UNIQUE violation, which broke
+            # every resume/retry of a cloud job. Prior rows are terminated on
+            # teardown/reconcile, so terminated_at IS NULL isolates the current
+            # one. (A terminating UPDATE still matches: the row is NULL until
+            # this very statement sets it.)
+            db.execute(f"UPDATE cloud_pods SET {cols} WHERE name=:name AND terminated_at IS NULL",
                        {**fields, "name": pod_name})
 
     def _ledger_insert(self, pod_name: str, gpu_type: str, rate: float) -> None:

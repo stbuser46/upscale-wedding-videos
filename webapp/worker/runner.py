@@ -1142,11 +1142,17 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 raise WorkerError("no cloud GPU became available")
             with dispatch_lock:
                 to_dispatch[0] -= 1  # this unit no longer needs a slot
+            # A pod that fails or times out its unit is suspect: retire it rather
+            # than recycle it into the next unit (a wedged pod would just fail
+            # that one too, while billing). A local slice failure leaves the pod
+            # unused and healthy, so it is handed back.
+            slot_healthy = True
             try:
                 if stop_reason():
                     return
                 slice_unit(stage1, unit["skip"], unit["cap"], spath,
-                           ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir)
+                           ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir,
+                           allow_short=(unit["seq"] == len(units) - 1))
                 _record_chunk(settings, job["id"], unit, upath, "running")
                 _heartbeat(settings, "running", active_job_id=job["id"],
                            detail=f"cloud: {fleet.ready}/{n_slots} slots, unit {unit['seq'] + 1}/{len(units)}")
@@ -1159,6 +1165,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 if res.status == -1:  # aborted (stop requested)
                     return
                 if res.status != 0:
+                    slot_healthy = False  # remote failure/timeout -> retire the pod
                     _record_chunk(settings, job["id"], unit, upath, "invalid")
                     raise WorkerError(f"unit {unit['seq']} failed on pod: {res.message}")
                 actual = _probe_frame_count(settings, upath)
@@ -1177,14 +1184,19 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     _unit_progress(settings, job, done, run_started, frames_at_start)
             finally:
                 if slot is not None:
-                    # More units still waiting for a slot -> hand it back.
-                    # None left -> retire the pod now so it stops billing.
-                    with dispatch_lock:
-                        more_work = to_dispatch[0] > 0
-                    if more_work:
-                        fleet.slot_queue.put(slot)
-                    else:
+                    if not slot_healthy:
+                        # Pod failed/timed out this unit -> terminate it now so it
+                        # stops billing and is never handed the next unit.
                         fleet.retire_slot(slot)
+                    else:
+                        # More units still waiting for a slot -> hand it back.
+                        # None left -> retire the pod now so it stops billing.
+                        with dispatch_lock:
+                            more_work = to_dispatch[0] > 0
+                        if more_work:
+                            fleet.slot_queue.put(slot)
+                        else:
+                            fleet.retire_slot(slot)
 
         with CloudFleet(settings, job, cfg, log=lambda m: print(m, flush=True)) as fleet:
             _ACTIVE_FLEET = fleet

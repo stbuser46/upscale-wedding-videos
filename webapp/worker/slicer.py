@@ -28,6 +28,8 @@ def slice_unit(
     ffmpeg_image: str = "linuxserver/ffmpeg:latest",
     data_dir: Path | None = None,
     use_docker: bool = True,
+    allow_short: bool = False,
+    short_tolerance: int = 50,
 ) -> Path:
     """Stream-copy frames [skip, skip+cap) of `stage1` into `dest`.
 
@@ -36,6 +38,13 @@ def slice_unit(
     for the output. Verifies the slice holds exactly `cap` frames before
     returning, so a truncated slice can never be shipped and silently restore
     the wrong footage.
+
+    `allow_short` relaxes that check for the final unit only: a chapter's real
+    frame count can fall a few frames below the catalog estimate, so the tail
+    slice legitimately runs off the end of `stage1`. When set, a slice up to
+    `short_tolerance` frames short of `cap` is accepted (the caller then shrinks
+    the unit to the frames that exist, mirroring the local path's post-restore
+    tolerance). A larger shortfall still fails.
     """
     stage1 = Path(stage1).resolve()
     dest = Path(dest).resolve()
@@ -76,7 +85,14 @@ def slice_unit(
         raise SliceError(f"ffmpeg slice failed ({result.returncode}): {result.stderr.strip()[:400]}")
 
     actual = probe_frame_count(part, ffmpeg_image=ffmpeg_image, data_dir=data_dir, use_docker=use_docker)
-    if actual != cap:
+    if allow_short:
+        # Tail unit: accept a bounded shortfall (ran off the end of stage-1),
+        # but never an empty, over-length, or grossly short slice.
+        if actual <= 0 or actual > cap or (cap - actual) > short_tolerance:
+            part.unlink(missing_ok=True)
+            raise SliceError(f"tail slice has {actual} frames, expected {cap} "
+                             f"within {short_tolerance} (skip={skip})")
+    elif actual != cap:
         part.unlink(missing_ok=True)
         raise SliceError(f"slice has {actual} frames, expected {cap} (skip={skip})")
     part.replace(dest)
