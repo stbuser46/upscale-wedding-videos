@@ -209,3 +209,29 @@ dl dd { margin: 5px 0 0; overflow-wrap: anywhere; }
 .section-tools { display: flex; align-items: end; gap: 16px; }
 .chapter-sort-label { display: flex; flex-direction: column; gap: 6px; }
 .chapter-sort-label select { min-height: 44px; border: 1px solid var(--line); border-radius: 12px; padding: 0 12px; background: var(--card); color: var(--ink); font: inherit; }
+
+/* Cloud fleet panel (queue page) */
+.cloud-panel { margin-top: 46px; background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 30px; box-shadow: var(--shadow); }
+.cloud-header { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; flex-wrap: wrap; margin-bottom: 22px; }
+.cloud-header h2 { font: 500 26px/1.2 Georgia, serif; margin: 4px 0 0; }
+.cloud-summary-pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 15px; border-radius: 999px; font-size: 13px; font-weight: 700; background: #dfeadd; color: #2c7a4b; border: 1px solid #bcd8bd; font-variant-numeric: tabular-nums; }
+.cloud-summary-pill[data-level="warn"] { background: #f3ead8; color: #8a6d3b; border-color: #e3d3ad; }
+.cloud-summary-pill[data-level="danger"] { background: #f5e0dd; color: #a13a30; border-color: #e6c3bd; }
+.cloud-pods { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+.cloud-card { background: var(--paper); border: 1px solid var(--line); border-radius: 15px; padding: 16px 18px; display: flex; flex-direction: column; gap: 11px; }
+.cloud-card.errored { border-color: #d8aaa6; box-shadow: 0 0 0 2px rgba(140,52,46,.08); }
+.cloud-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.cloud-pod-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-weight: 600; }
+.cloud-state { display: inline-flex; border-radius: 999px; padding: 4px 9px; background: #ece6de; color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; white-space: nowrap; }
+.cloud-state.running { background: #e3ebe3; color: #526452; }
+.cloud-state.ready { background: #e0e9f2; color: #2a5d78; }
+.cloud-state.creating, .cloud-state.terminating { background: #f3ead8; color: #8a6d3b; }
+.cloud-state.terminated { background: #ece6de; color: var(--muted); }
+.cloud-gpu { font: 500 16px Georgia, serif; }
+.cloud-job { font-size: 12px; }
+.cloud-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.cloud-stat { display: flex; flex-direction: column; gap: 3px; }
+.cloud-stat strong { font: 500 15px Georgia, serif; font-variant-numeric: tabular-nums; }
+.cloud-stat span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
+.cloud-error { margin: 0; color: #8c342e; font-size: 12px; line-height: 1.4; background: #f5e4e1; border-radius: 8px; padding: 8px 10px; }
+.cloud-local-note { font-size: 13px; margin: 6px 0 0; }

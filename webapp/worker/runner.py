@@ -60,6 +60,13 @@ def _handle_shutdown(signum, _frame) -> None:
     print(f"Received signal {signum}; shutting down worker and releasing GPU", flush=True)
     if _ACTIVE_CONTAINER is not None:
         _stop_container(_ACTIVE_CONTAINER)
+    # A cloud job's pods keep billing until deleted — terminate them on the way
+    # out so a stopped worker never leaks paid GPUs.
+    if _ACTIVE_FLEET is not None:
+        try:
+            _ACTIVE_FLEET.terminate_all()
+        except Exception as exc:  # never let cleanup crash the handler
+            print(f"fleet termination during shutdown failed: {exc}", flush=True)
 
 
 def _install_signal_handlers() -> None:
@@ -939,6 +946,288 @@ def _run_units(settings: Settings, job) -> int:
     return 0
 
 
+# ── Cloud fan-out ────────────────────────────────────────────────────────────
+# When WEDDING_EXECUTOR=cloud, durable units are dispatched to rented RunPod GPUs
+# instead of the local card. Stage 1 (deinterlace) still runs locally on CPU; its
+# intra-only FFV1 output is sliced per unit and shipped. Assembly and validation
+# stay local and unchanged. The control plane never leaves the homeserver.
+
+_ACTIVE_FLEET = None  # set while a cloud job runs, so shutdown terminates its pods
+
+
+def _cloud_enabled() -> bool:
+    return os.environ.get("WEDDING_EXECUTOR", "local").lower() == "cloud"
+
+
+def _reconcile_cloud_pods(settings: Settings) -> None:
+    """On worker startup terminate every pod this project owns, and mark the
+    ledger terminated. A cloud job never survives a worker restart (its in-memory
+    thread pool is gone), so any live pod is an orphan billing money — kill it.
+    The job itself is requeued by _recover_interrupted and resumes from its valid
+    units on fresh pods. This is the money-safety analogue of interrupted-job
+    recovery."""
+    try:
+        from webapp.cloud.runpod_api import RunpodClient, RunpodError
+        client = RunpodClient()
+        killed = 0
+        for pod in client.our_pods():
+            try:
+                client.terminate_pod(pod["id"])
+                killed += 1
+            except RunpodError as exc:
+                print(f"reconcile: failed to terminate orphan pod {pod.get('id')}: {exc}", flush=True)
+        if killed:
+            print(f"reconcile: terminated {killed} orphaned cloud pod(s) from a previous run", flush=True)
+        with connect(settings.database_path) as db, transaction(db):
+            db.execute(
+                "UPDATE cloud_pods SET state='terminated', terminated_at=? WHERE state != 'terminated'",
+                (utc_now(),),
+            )
+    except Exception as exc:  # never block startup on cloud reconciliation
+        print(f"reconcile: cloud pod reconciliation skipped: {exc}", flush=True)
+
+
+def _run_prepare(settings: Settings, job, source, start_sec: float, duration: float, log_path: Path) -> int:
+    """Run stage-1 deinterlace locally (PREPARE_ONLY) so the FFV1 intermediate
+    exists to slice. Reuses pipeline_v3.sh so the exact pinned deinterlace command
+    is shared with the local path."""
+    env = os.environ.copy()
+    env.update(
+        PIPELINE_WORK_ROOT=str(settings.data_dir / "restoration_work"),
+        PIPELINE_FREE_SPACE_RESERVE_BYTES=str(settings.free_space_reserve_bytes),
+        PREPARE_ONLY="1", FORCE="0",
+    )
+    command = [str(settings.pipeline_path), str(source), f"{start_sec:.3f}", f"{duration:.3f}",
+               str(job["output_path"]), job["public_id"]]
+    return _run_logged(settings, job, command, env, log_path,
+                       heartbeat_detail="preparing 50p (deinterlace)")
+
+
+def _stage_seedvr2_tree(settings: Settings) -> Path:
+    """docker cp the already-patched /opt/SeedVR2 out of the pinned image into the
+    pod provisioning dir, so every pod gets byte-identical code (pinned commit +
+    all three patches) rather than re-cloning. Staged once per worker run."""
+    image = os.environ.get("SEEDVR2_IMAGE", "seedvr2-cuda:v3")
+    pdir = settings.project_root / "docker" / "seedvr2-pod"
+    dest = pdir / "_tree" / "SeedVR2"
+    if (dest / "inference_cli.py").is_file():
+        return pdir
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cid = subprocess.run(["docker", "create", image], check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        subprocess.run(["docker", "cp", f"{cid}:/opt/SeedVR2", str(dest)], check=True, capture_output=True)
+    finally:
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+    if not (dest / "inference_cli.py").is_file():
+        raise WorkerError(f"staged SeedVR2 tree from {image} has no inference_cli.py")
+    return pdir
+
+
+def _cloud_fleet_config(settings: Settings):
+    from webapp.cloud.fleet import FleetConfig
+    from webapp.cloud.runpod_api import STOCK_BASE_IMAGE
+    prefs = os.environ.get(
+        "WEDDING_CLOUD_GPU_PREFERENCE",
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    )
+    gpu_ids = [p.strip() for p in prefs.split(",") if p.strip()]
+    provision_dir = _stage_seedvr2_tree(settings)
+    cache = settings.data_dir / "restoration_work" / ".inductor_cache"
+    return FleetConfig(
+        image=os.environ.get("WEDDING_CLOUD_IMAGE", STOCK_BASE_IMAGE),
+        gpu_type_ids=gpu_ids,
+        cloud_type=os.environ.get("WEDDING_CLOUD_TIER", "SECURE"),
+        max_slots=int(os.environ.get("WEDDING_CLOUD_MAX_SLOTS", "16")),
+        spend_cap_usd=float(os.environ.get("WEDDING_CLOUD_SPEND_CAP_USD", "250")),
+        provision_dir=provision_dir,
+        inductor_cache=cache if cache.is_dir() else None,
+    )
+
+
+def _run_units_cloud(settings: Settings, job) -> int:
+    """Restore a job's units concurrently across a fleet of rented GPUs, then
+    assemble locally. Mirrors _run_units' durable/resume/validation contract; the
+    only difference is many units run at once on pods instead of one at a time
+    on the local card."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from webapp.cloud.fleet import CloudFleet
+    from webapp.cloud.executor import run_unit_remote
+    from webapp.worker.slicer import slice_unit, SliceError
+    global _ACTIVE_FLEET
+
+    source = _allowed_source(settings, job["source_cache_path"])
+    output = Path(job["output_path"]).resolve()
+    log = Path(job["log_path"]).resolve()
+    for generated in (output, log):
+        if not generated.is_relative_to(settings.data_dir):
+            raise WorkerError("Generated job path escaped the application data directory")
+        generated.parent.mkdir(parents=True, exist_ok=True)
+    duration = (job["source_end_ms"] - job["source_start_ms"]) / 1000
+    start_sec = job["source_start_ms"] / 1000
+    snapshot = json.loads(job["settings_json"])
+    chunk, overlap = int(snapshot["chunk"]), int(snapshot["overlap"])
+    model, resolution, batch = str(snapshot["model"]), int(snapshot["resolution"]), int(snapshot["batch"])
+    units = _plan_units(job["frames_total"], chunk, overlap)
+    work = settings.data_dir / "restoration_work" / job["public_id"]
+    units_dir = work / "units"
+    slices_dir = work / "slices"
+    stage1 = work / "input_50p_ffv1.mkv"
+    units_dir.mkdir(parents=True, exist_ok=True)
+    slices_dir.mkdir(parents=True, exist_ok=True)
+
+    _set_state(settings, job["id"], "running", "seedvr2_restore")
+
+    # Stage 1 locally (CPU) if not already present, so slices can be cut.
+    if not stage1.is_file():
+        _heartbeat(settings, "running", active_job_id=job["id"], detail="preparing 50p (deinterlace)")
+        rc = _run_prepare(settings, job, source, start_sec, duration, log)
+        if rc == STATUS_SHUTDOWN:
+            return STATUS_SHUTDOWN
+        if rc != 0 or not stage1.is_file():
+            raise WorkerError(f"stage-1 prepare failed (status {rc})")
+
+    def stop_reason() -> str | None:
+        if _SHUTDOWN:
+            return "shutdown"
+        state = _job_state(settings, job["id"])
+        if state == "cancel_requested":
+            return "cancel"
+        if state == "pause_requested":
+            return "pause"
+        return None
+
+    # Resume: skip units already valid on disk.
+    pending = []
+    for unit in units:
+        upath = units_dir / f"unit_{unit['seq']:05d}.mkv"
+        if _chunk_valid(settings, job["id"], unit, upath):
+            _units_frames_done(settings, job["id"])
+        else:
+            pending.append(unit)
+
+    if pending:
+        reason = stop_reason()
+        if reason == "cancel":
+            return 75
+        if reason == "pause":
+            return STATUS_PAUSED
+        if reason == "shutdown":
+            return STATUS_SHUTDOWN
+
+        cfg = _cloud_fleet_config(settings)
+        n_slots = min(cfg.max_slots, len(pending))
+        run_started = time.monotonic()
+        frames_at_start = _units_frames_done(settings, job["id"]) or 0
+        _unit_progress(settings, job, frames_at_start, run_started, frames_at_start)
+        errors: list[str] = []
+        # Units still waiting to acquire a slot. When this hits zero, a pod that
+        # finishes its unit has no more work, so it retires immediately instead
+        # of idling (and billing) until the whole job ends.
+        import threading as _threading
+        dispatch_lock = _threading.Lock()
+        to_dispatch = [len(pending)]
+
+        def process(unit) -> None:
+            if stop_reason():
+                return
+            upath = units_dir / f"unit_{unit['seq']:05d}.mkv"
+            spath = slices_dir / f"unit_{unit['seq']:05d}.mkv"
+            # Wait as long as the fleet can still hand out a slot; units queue for
+            # slots by design (many more units than pods). None => aborted or no
+            # pod will ever come up.
+            slot = fleet.acquire_slot(stop_check=lambda: stop_reason() is not None)
+            if slot is None:
+                if stop_reason():
+                    return
+                raise WorkerError("no cloud GPU became available")
+            with dispatch_lock:
+                to_dispatch[0] -= 1  # this unit no longer needs a slot
+            try:
+                if stop_reason():
+                    return
+                slice_unit(stage1, unit["skip"], unit["cap"], spath,
+                           ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir)
+                _record_chunk(settings, job["id"], unit, upath, "running")
+                _heartbeat(settings, "running", active_job_id=job["id"],
+                           detail=f"cloud: {fleet.ready}/{n_slots} slots, unit {unit['seq'] + 1}/{len(units)}")
+                res = run_unit_remote(
+                    slot.endpoint, cfg.ssh_key, slice_path=spath, local_out=upath, unit=unit,
+                    model=model, resolution=resolution, batch=batch, overlap=overlap,
+                    log_path=log, should_abort=lambda: stop_reason() is not None,
+                )
+                spath.unlink(missing_ok=True)
+                if res.status == -1:  # aborted (stop requested)
+                    return
+                if res.status != 0:
+                    _record_chunk(settings, job["id"], unit, upath, "invalid")
+                    raise WorkerError(f"unit {unit['seq']} failed on pod: {res.message}")
+                actual = _probe_frame_count(settings, upath)
+                local_unit = unit
+                if actual != unit["new"]:
+                    shortfall = unit["new"] - actual
+                    if unit["seq"] == len(units) - 1 and 0 < shortfall <= 50:
+                        _set_frames_total(settings, job["id"], unit["start"] + actual)
+                        local_unit = {**unit, "new": actual}
+                    else:
+                        _record_chunk(settings, job["id"], unit, upath, "invalid")
+                        raise WorkerError(f"unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
+                _record_chunk(settings, job["id"], local_unit, upath, "valid", frame_count=actual)
+                done = _units_frames_done(settings, job["id"])
+                if done is not None:
+                    _unit_progress(settings, job, done, run_started, frames_at_start)
+            finally:
+                if slot is not None:
+                    # More units still waiting for a slot -> hand it back.
+                    # None left -> retire the pod now so it stops billing.
+                    with dispatch_lock:
+                        more_work = to_dispatch[0] > 0
+                    if more_work:
+                        fleet.slot_queue.put(slot)
+                    else:
+                        fleet.retire_slot(slot)
+
+        with CloudFleet(settings, job, cfg, log=lambda m: print(m, flush=True)) as fleet:
+            _ACTIVE_FLEET = fleet
+            try:
+                fleet.provision(n_slots)
+                with ThreadPoolExecutor(max_workers=n_slots) as ex:
+                    futures = {ex.submit(process, u): u for u in pending}
+                    for fut in as_completed(futures):
+                        exc = fut.exception()
+                        if exc is not None:
+                            errors.append(str(exc))
+            finally:
+                _ACTIVE_FLEET = None
+
+        reason = stop_reason()
+        if reason == "shutdown":
+            return STATUS_SHUTDOWN
+        if reason == "cancel":
+            return 75
+        if reason == "pause":
+            return STATUS_PAUSED
+        if errors:
+            raise WorkerError(f"{len(errors)} unit(s) failed: {errors[0]}")
+
+    # All units valid → assemble locally (lossless concat + FLAC mux).
+    reason = stop_reason()
+    if reason == "shutdown":
+        return STATUS_SHUTDOWN
+    if reason == "cancel":
+        return 75
+    if reason == "pause":
+        return STATUS_PAUSED
+    manifest = work / "units.manifest"
+    manifest.write_text("\n".join(str(units_dir / f"unit_{u['seq']:05d}.mkv") for u in units) + "\n")
+    _set_state(settings, job["id"], "assembling", "audio_mux")
+    status = _assemble(settings, job, manifest, source, start_sec, duration, log)
+    if status == STATUS_SHUTDOWN:
+        return STATUS_SHUTDOWN
+    if status != 0:
+        raise WorkerError(f"Assembly failed with status {status}")
+    return 0
+
+
 def run_job(settings: Settings, job) -> None:
     free = shutil.disk_usage(settings.data_dir).free
     if free < settings.free_space_reserve_bytes:
@@ -951,7 +1240,12 @@ def run_job(settings: Settings, job) -> None:
     container = _container_name(job["public_id"])
     durable = os.environ.get("WEDDING_DURABLE_UNITS") == "1"
     try:
-        status = _run_units(settings, job) if durable else _run_pipeline(settings, job)
+        if durable and _cloud_enabled():
+            status = _run_units_cloud(settings, job)
+        elif durable:
+            status = _run_units(settings, job)
+        else:
+            status = _run_pipeline(settings, job)
     except Exception as exc:
         # An unexpected failure must not leave the GPU container (and ~60 GB of
         # VRAM) running while the job is marked failed.
@@ -1004,7 +1298,14 @@ def main(argv: list[str] | None = None) -> None:
     # continuously idle (no foreign compute process, enough free VRAM) for the
     # dwell time. Prevents starting SeedVR2 into a busy GPU and OOMing — exactly
     # the failure seen when the torrent stack's ollama holds ~56 GiB.
-    idle_gate = IdleGate(IdlePolicy.from_env()) if os.environ.get("WEDDING_IDLE_GATE") == "1" else None
+    # The idle gate protects the LOCAL card from being claimed while a foreign
+    # workload holds VRAM. Cloud units run on rented GPUs, so the local card is
+    # irrelevant — never gate cloud jobs on local idleness.
+    idle_gate = (
+        IdleGate(IdlePolicy.from_env())
+        if os.environ.get("WEDDING_IDLE_GATE") == "1" and not _cloud_enabled()
+        else None
+    )
     gate_poll_seconds = 2.0
     with GpuLock(settings.data_dir / "worker" / "gpu.lock"):
         _heartbeat(settings, "idle", started=True)
@@ -1013,6 +1314,9 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             _heartbeat(settings, "idle", error=f"interrupted-job recovery failed: {exc}")
             print(f"Recovery failed (continuing): {exc}", flush=True)
+        # Kill any cloud pods orphaned by a previous crash before claiming work.
+        if _cloud_enabled():
+            _reconcile_cloud_pods(settings)
         backoff = max(0.2, args.poll_seconds)
         while not _SHUTDOWN:
             # Idle gate: if work is waiting but the GPU is not idle enough, hold

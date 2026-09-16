@@ -46,7 +46,7 @@ POD_NAME_PREFIX = "wedding-"
 # A unit peaks near 60 GiB of VRAM and ~63 GiB of host RAM, and ends with a
 # 750-frame 10-bit HEVC encode on the CPU. Refuse flavours that cannot hold it.
 MIN_VRAM_GB = 78
-MIN_RAM_PER_GPU_GB = 100
+MIN_RAM_PER_GPU_GB = 80   # a unit peaks ~63 GiB host RAM; 80 leaves headroom without over-filtering machines
 MIN_VCPU_PER_GPU = 8
 
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
@@ -283,7 +283,7 @@ class RunpodClient:
         image: str,
         gpu_type_ids: Sequence[str],
         public_key: str,
-        container_disk_gb: int = 120,
+        container_disk_gb: int = 40,
         volume_gb: int = 0,
         cloud_type: str = "SECURE",
         env: dict[str, str] | None = None,

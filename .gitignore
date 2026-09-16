@@ -36,3 +36,7 @@ node_modules/
 *.sqlite-wal
 *.sqlite-shm
 *.db
+
+# Runtime-staged SeedVR2 tree for pod provisioning
+docker/seedvr2-pod/_tree/
+docker/seedvr2-pod/inductor_cache.tar

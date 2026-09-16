@@ -275,6 +275,63 @@ async function loadJob() {
   } catch (error) { notify(error.message, true); }
 }
 
+// ---- Cloud fleet panel (queue page) ----
+function formatUptime(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function cloudStat(label, value) {
+  const cell = el("div", "cloud-stat");
+  cell.append(el("strong", "", value), el("span", "", label));
+  return cell;
+}
+
+function cloudPodCard(pod) {
+  const card = el("article", `cloud-card${pod.error ? " errored" : ""}`);
+  const head = el("div", "cloud-card-head");
+  const shortId = (pod.pod_id || pod.name || "pod").slice(0, 12);
+  head.append(el("span", "cloud-pod-id", shortId), el("span", `cloud-state ${pod.state}`, pod.state.replaceAll("_", " ")));
+  const job = pod.job_public_id ? `job ${pod.job_public_id}` : "unassigned";
+  const unit = pod.unit === null || pod.unit === undefined ? "—" : `#${pod.unit}`;
+  const meta = el("div", "cloud-meta");
+  meta.append(cloudStat("Unit", unit), cloudStat("Uptime", formatUptime(pod.uptime_s)), cloudStat("Cost", `$${pod.cost_usd.toFixed(2)}`));
+  card.append(head, el("div", "cloud-gpu", pod.gpu || "GPU"), el("div", "cloud-job muted", job), meta);
+  if (pod.error) card.append(el("p", "cloud-error", pod.error));
+  return card;
+}
+
+function renderCloudFleet(fleet) {
+  const s = fleet.summary;
+  const pill = document.getElementById("cloud-summary");
+  if (pill) {
+    pill.textContent = `${s.active}/${s.max_slots} GPUs active · $${s.rate_per_hr.toFixed(2)}/h · $${s.spend_usd.toFixed(2)} spent / $${s.spend_cap_usd.toFixed(0)} cap`;
+    const ratio = s.spend_cap_usd > 0 ? s.spend_usd / s.spend_cap_usd : 0;
+    pill.dataset.level = ratio >= 1 ? "danger" : ratio >= 0.75 ? "warn" : "ok";
+  }
+  const grid = document.getElementById("cloud-pods");
+  if (grid) grid.replaceChildren(...(fleet.pods.length ? fleet.pods.map(cloudPodCard) : [el("div", "empty-state", "No pods reported yet.")]));
+}
+
+let cloudLoading = false;
+async function loadCloudFleet() {
+  if (cloudLoading || document.hidden) return;
+  const panel = document.getElementById("cloud-fleet");
+  if (!panel) return;
+  cloudLoading = true;
+  try {
+    const fleet = await api("/api/cloud/fleet");
+    const localNote = document.getElementById("metrics-local-note");
+    panel.classList.toggle("hidden", !fleet.enabled);
+    localNote?.classList.toggle("hidden", !fleet.enabled);
+    if (fleet.enabled) renderCloudFleet(fleet);
+  } catch (error) { /* cloud fleet is auxiliary; never toast-spam the queue page */ }
+  finally { cloudLoading = false; }
+}
+
 // ---- System load graph (queue page) ----
 const METRIC_SERIES = [
   {key: "gpu_pct", label: "GPU", color: "#1baf7a"},
@@ -448,4 +505,8 @@ const page = document.body.dataset.page;
 if (page === "library" && document.body.dataset.titleId) loadTitle();
 else if (page === "library") loadLibrary();
 else if (page === "queue" && document.body.dataset.publicId) { loadJob(); window.setInterval(loadJob, 2000); }
-else if (page === "queue") { initQueueFilter(); loadQueue(); window.setInterval(loadQueue, 2000); initMetrics(); }
+else if (page === "queue") {
+  initQueueFilter(); loadQueue(); window.setInterval(loadQueue, 2000); initMetrics();
+  loadCloudFleet(); window.setInterval(loadCloudFleet, 3000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) loadCloudFleet(); });
+}

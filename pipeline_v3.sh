@@ -205,6 +205,15 @@ fi
 emit_event "stage_complete" "prepare_50p"
 check_cancel "prepare_50p"
 
+# ── Prepare-only mode ────────────────────────────────────────────────────────
+# Cloud fan-out runs the CPU deinterlace locally once, then slices the stage-1
+# file per unit and ships slices to pods (pods have no local source). PREPARE_ONLY
+# stops here with the stage-1 file produced; no baseline, no restore, no mux.
+if [[ "${PREPARE_ONLY:-0}" == 1 ]]; then
+  echo "PREPARE DONE $DEINTERLACED"
+  exit 0
+fi
+
 # ── Durable-unit mode ────────────────────────────────────────────────────────
 # When UNIT_OUTPUT is set, restore exactly ONE unit of the prepared 50p input as
 # a standalone HEVC file and exit. Stage 1 above is reused across a job's units

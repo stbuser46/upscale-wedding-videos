@@ -10,9 +10,17 @@
   <span class="muted" id="queue-filter-note"></span>
 </div>
 <section id="queue-list" class="queue-list" aria-live="polite"><div class="loading">Loading queue…</div></section>
+<section id="cloud-fleet" class="cloud-panel hidden" aria-label="Cloud GPU fleet">
+  <div class="cloud-header">
+    <div><p class="eyebrow">Cloud fleet · RunPod</p><h2>Remote GPU pods</h2></div>
+    <span id="cloud-summary" class="cloud-summary-pill" data-level="ok"></span>
+  </div>
+  <div id="cloud-pods" class="cloud-pods" aria-live="polite"></div>
+</section>
 <section class="metrics-panel" aria-label="System load">
   <div class="metrics-header">
-    <div><p class="eyebrow">System load</p><h2>GPU &amp; CPU utilisation</h2></div>
+    <div><p class="eyebrow">System load</p><h2>GPU &amp; CPU utilisation</h2>
+      <p id="metrics-local-note" class="muted cloud-local-note hidden">Local homeserver GPU — cloud units run remotely.</p></div>
     <div class="metrics-ranges" id="metrics-ranges" role="group" aria-label="Time range">
       <button type="button" class="button small" data-minutes="15">15m</button>
       <button type="button" class="button small active" data-minutes="60">1h</button>
