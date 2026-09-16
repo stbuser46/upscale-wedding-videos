@@ -6,7 +6,7 @@ This project preserves and restores old home DVDs — weddings, birthdays, and o
 
 - **Run the restoration pipeline** — `pipeline_v3.sh` is the proven quality-first 50p SeedVR2 restoration pipeline that preserves motion and restores temporal quality, processing a chapter as a series of durable ~750-frame units.
 - **Manage conversions remotely** — `webapp/` provides a private web application to catalog DVD chapters, queue restoration jobs, and monitor long-running GPU work from anywhere.
-- **Fan out to the cloud** — `webapp/cloud/` can rent RunPod GPUs to run individual restoration units off-box. Today this is a standalone CLI (foundation only); the webapp worker does not yet orchestrate pods.
+- **Fan out to the cloud** — the worker can slice a chapter into durable units and restore them in parallel on a fleet of rented RunPod GPUs (`webapp/cloud/`). It is **opt-in and dormant by default**: it only runs when the worker is started with `WEDDING_EXECUTOR=cloud`; otherwise every job runs on the local GPU exactly as before. (Not yet live-verified against real pods — see the money-safety note in `docs/ARCHITECTURE.md` before enabling.)
 - **Review and validate output** — The webapp shows progress, logs, and completion status; historical blind comparison UI remains in `webui/`.
 
 ## Key locations
@@ -36,7 +36,7 @@ The v3 pipeline preserves both bottom-field-first PAL motion samples as 50p, cre
 
 **Restoration progress** — The Yacoob & Aysha wedding is **fully restored on the local RTX PRO 6000**: all 22 chapters (DVD 1: 15, DVD 2: 7) are processed, validated, and delivered to the NAS as per-chapter "Restored HD" files under `nas.home:/volume1/Movies/WeddingFilm/Yacoob And Aysha/`. This is the first complete disc-set restoration; the pipeline is production-proven well beyond the 18-second reference.
 
-**Cloud fan-out (foundation)** — `webapp/cloud/` adds the substrate to run durable restoration units on rented RunPod GPUs instead of, or alongside, the local card: a stdlib-only control-plane client, a standalone "Stage A" pod CLI (rent → provision → run one unit → tear down), a money-safety reaper, a pod image under `docker/seedvr2-pod/`, and a `cloud_pods` spend ledger. `lib/seedvr2_unit_args.sh` gives the local and cloud paths one shared argv so they can never drift. This is **foundation only** — cloud runs are CLI-driven; the webapp worker does not yet schedule or orchestrate pods. See `docs/ARCHITECTURE.md`.
+**Cloud fan-out** — `webapp/cloud/` runs durable restoration units on rented RunPod GPUs: a stdlib-only control-plane client, a concurrent pod fleet (`fleet.py`) with a spend cap and guaranteed teardown, a remote unit executor (`executor.py`), a chapter slicer, a money-safety reaper, a pod image under `docker/seedvr2-pod/`, and a `cloud_pods` spend ledger surfaced by a read-only "Cloud fleet" UI panel. `lib/seedvr2_unit_args.sh` gives the local and cloud paths one shared argv so they can never drift. The worker selects local vs cloud **per process** via `WEDDING_EXECUTOR` (default `local`) — there is no per-job cloud toggle in the GUI. A standalone CLI (`python -m webapp.cloud.cli`) can also drive a single pod for testing. See `docs/ARCHITECTURE.md`, including its money-safety follow-ups.
 
 Cancellation is honored only between major pipeline stages and durable units; interactive pause/resume is not yet implemented.
 

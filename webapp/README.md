@@ -11,9 +11,10 @@ pause/resume is still deliberately unavailable: cancellation takes effect only
 after the current `pipeline_v3.sh` unit/stage finishes. It has restored the
 complete Yacoob & Aysha wedding (all 22 chapters, both DVDs) on the local GPU.
 
-A **cloud fan-out foundation** (`webapp/cloud/`) can run individual units on
-rented RunPod GPUs, but it is standalone and CLI-driven today — the worker does
-not orchestrate pods (see "Cloud fan-out" below and `docs/ARCHITECTURE.md`).
+**Cloud fan-out** (`webapp/cloud/`) lets the worker restore a chapter's units in
+parallel on rented RunPod GPUs. It is opt-in and dormant by default: local-GPU
+operation through the GUI is unchanged unless the worker is started with
+`WEDDING_EXECUTOR=cloud` (see "Cloud fan-out" below and `docs/ARCHITECTURE.md`).
 
 ## Folder layout
 
@@ -170,13 +171,41 @@ GPU-hours cost), and the queue page can hide finished and cancelled jobs.
   is allowed to finish, then `pipeline_v3.sh` exits at the boundary and releases
   GPU memory. There is no pause command in Phase 2.
 
-## Cloud fan-out (foundation, standalone)
+## Cloud fan-out
 
-`webapp/cloud/` can offload a single durable unit to a rented RunPod GPU. It is
-**standalone Stage A**: it does not touch the catalog database or the running
-worker, so it can be exercised for a couple of dollars without any risk to a
-local restoration. Requirements: a RunPod API key in `webapp/data/runpod.env`
-and an SSH key under `cloud/keys/` (both gitignored).
+`webapp/cloud/` can restore durable units on rented RunPod GPUs. Requirements: a
+RunPod API key in `webapp/data/runpod.env` and an SSH key under `cloud/keys/`
+(both gitignored).
+
+> **Money-safety, read before enabling.** Pods bill until deleted. Teardown is
+> automatic only on a graceful worker exit/restart; a hard kill (SIGKILL, OOM,
+> power loss) can leave up to `WEDDING_CLOUD_MAX_SLOTS` pods billing until you
+> run the reaper by hand. Before setting `WEDDING_EXECUTOR=cloud`, set a RunPod
+> **account spend limit** and/or schedule `python -m webapp.cloud.reaper --yes`
+> on a timer. The cloud path is also not yet live-verified end to end.
+
+### Worker fleet mode (opt-in)
+
+Start the worker with `WEDDING_EXECUTOR=cloud` and it dispatches a chapter's
+durable units across a concurrent pod fleet instead of the local card. This is a
+**worker-wide, per-process** choice — there is no per-job toggle in the GUI, and
+with the default (`local`) the cloud code never runs. Tuning:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WEDDING_EXECUTOR` | `local` | Set to `cloud` to run durable units on RunPod pods. |
+| `WEDDING_CLOUD_MAX_SLOTS` | `16` | Pods brought up in parallel. |
+| `WEDDING_CLOUD_SPEND_CAP_USD` | `250` | Fleet stops launching pods past this estimated spend (checked at bring-up only). |
+| `WEDDING_CLOUD_TIER` | `SECURE` | RunPod cloud tier. |
+| `WEDDING_CLOUD_GPU_PREFERENCE` | — | Preferred `gpuTypeId`s, in order. |
+
+The queue page shows a read-only **Cloud fleet** panel (live pods, uptime, and
+running spend) while cloud jobs run; it stays hidden for local-only operation.
+
+### Standalone pod CLI (testing)
+
+The CLI drives a single pod without touching the catalog database or worker, so
+the cloud path can be exercised for a couple of dollars in isolation.
 
 ```bash
 # Show GPU offers and current stock, then rent, run one unit, and tear down.
@@ -200,8 +229,9 @@ webapp/.venv/bin/python -m webapp.cloud.reaper --yes       # terminate them all
 
 The unit argv is shared with the local pipeline via `lib/seedvr2_unit_args.sh`,
 and `scripts/test_slice_equivalence.sh` proves (CPU-only) that a stream-copy
-slice feeds SeedVR2 byte-identically to a whole-file read. The worker does not
-yet schedule or reconcile pods; that integration is future work.
+slice feeds SeedVR2 byte-identically to a whole-file read. Every pod is written
+to the `cloud_pods` ledger before creation and terminated on teardown; the
+reaper above is the money-safety backstop for both modes.
 
 ## systemd and Docker later
 

@@ -2,8 +2,9 @@
 
 Status: Phase 1 and Phase 2 implemented on 2026-08-04; durable ~750-frame
 restoration units in production (the worker default); the complete Yacoob &
-Aysha wedding restored on the local GPU; a cloud fan-out foundation added
-2026-09-12.
+Aysha wedding restored on the local GPU; and an opt-in cloud fan-out path that
+dispatches units across a fleet of rented RunPod GPUs (default executor remains
+local).
 
 The authoritative product behavior remains in
 [`WEB_UI_SPEC.md`](WEB_UI_SPEC.md); the proven media settings remain in
@@ -72,13 +73,22 @@ slice through the authenticated API and ran it through the queue worker and
 metric, and log events during the 339-second run. Authenticated HTTP Range
 delivery returned `206 Partial Content` for the completed output.
 
-## Cloud fan-out (foundation)
+## Cloud fan-out
 
-Added 2026-09-12 (commit `9e7ccf5`). This is the substrate for running durable
-restoration units on rented RunPod GPUs instead of, or alongside, the single
-local card. It is deliberately a **standalone "Stage A"**: it can be proved end
-to end for a couple of dollars before any worker or database integration is
-written, so nothing here can disturb a running local restoration.
+Runs durable restoration units on rented RunPod GPUs instead of, or alongside,
+the single local card. It landed in two layers: a **foundation** (2026-09-12,
+commit `9e7ccf5`) that could be proved end to end for a couple of dollars as a
+standalone CLI, then the **worker/fleet integration** that dispatches a
+chapter's units across a concurrent pod fleet.
+
+The cloud path is **opt-in and dormant by default**. The worker chooses its
+executor per process from `WEDDING_EXECUTOR` (default `local`); only
+`WEDDING_EXECUTOR=cloud` routes durable units to pods (`run_job` →
+`_run_units_cloud`). With the default, local-GPU restoration through the GUI is
+byte-for-byte unchanged, and none of the code below runs. The choice is
+worker-wide — there is no per-job cloud toggle in the API or GUI.
+
+### Foundation (standalone)
 
 - `lib/seedvr2_unit_args.sh` is the single source of truth for the SeedVR2
   durable-unit argv. Both paths render their command from it — `pipeline_v3.sh`
@@ -110,10 +120,45 @@ written, so nothing here can disturb a running local restoration.
   compares per-frame decoded MD5s (CPU-only, no GPU) to prove that shipping a
   pod only its unit's frames feeds SeedVR2 byte-identically to a whole-file read.
 
-**Not yet built:** the webapp worker does not schedule, launch, or reconcile
-pods, so there is no automatic local/cloud placement, no multi-pod fan-out of a
-single chapter, and no UI surface. The `cloud_pods` table and ledger exist, but
-the worker path that fills them is future work.
+### Worker/fleet integration
+
+- `webapp/worker/slicer.py` cuts a chapter's stage-1 file into per-unit slices
+  on exact frame boundaries (the equivalence proven above), so each pod is
+  shipped only the frames its unit needs. The final unit tolerates a bounded
+  short slice (`allow_short`), mirroring the local path's tail tolerance.
+- `webapp/cloud/fleet.py` is a concurrent pod slot pool: it brings up
+  `WEDDING_CLOUD_MAX_SLOTS` pods (default 16) in parallel, hands each out as a
+  slot the moment it is provisioned, retires an idle pod immediately so it stops
+  billing, and enforces `WEDDING_CLOUD_SPEND_CAP_USD` (default 250). It is a
+  context manager whose `terminate_all()` also sweeps RunPod for any stray pod
+  carrying this job's name prefix, so teardown never depends on a clean exit.
+- `webapp/cloud/executor.py` restores one unit on a pod (upload slice → run the
+  shared `seedvr2_unit_argv` → download result), with abort polling and a hard
+  per-unit timeout; a pod that fails or times out a unit is retired, not reused.
+- `webapp/worker/runner.py` gains `_run_units_cloud`, pod reconciliation on
+  startup (`_reconcile_cloud_pods`, terminating pods orphaned by a prior graceful
+  restart), and the executor switch. The local durable-unit and whole-pipeline
+  paths are untouched.
+- `webapp/server/cloud_views.py` adds a read-only `/api/cloud` fleet-status
+  endpoint (live pods, uptime, derived spend), rendered as a "Cloud fleet" panel
+  on the queue page. It degrades to `{"enabled": false}` on a database without
+  the `cloud_pods` table, so local-only deployments are unaffected.
+
+**Money-safety follow-ups (do before relying on cloud mode):** teardown is
+guaranteed only on a *graceful* worker exit or restart — a `SIGKILL`/OOM/power
+loss can leave up to `WEDDING_CLOUD_MAX_SLOTS` pods billing until the reaper is
+run by hand, because the reaper is not yet scheduled on an independent timer.
+Set a RunPod **account-level spend limit** and/or a cron/systemd timer running
+`python -m webapp.cloud.reaper --yes` before enabling `WEDDING_EXECUTOR=cloud`.
+The `WEDDING_CLOUD_SPEND_CAP_USD` guard is checked only at pod bring-up, and
+`pod_ttl_s` is defined but not yet enforced at runtime.
+
+**Not yet built:** no per-job or in-GUI choice of executor (it is a worker-wide
+env var), no automatic local↔cloud placement or cost-based scheduling, no
+per-unit retry (one failed unit fails the run), and no mixed local+cloud
+execution within one job. The cloud path is also **not yet live-verified against
+real pods** — the fixes to the resume ledger, tail-slice tolerance, and bad-pod
+retirement are code-reviewed but await a paid end-to-end run.
 
 ## Not implemented
 
