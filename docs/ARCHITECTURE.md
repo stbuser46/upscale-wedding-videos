@@ -1,11 +1,22 @@
 # Web application architecture and phase status
 
-Status: Phase 1 and Phase 2 implemented on 2026-08-04.
+Status: Phase 1 and Phase 2 implemented on 2026-08-04; durable ~750-frame
+restoration units in production (the worker default); the complete Yacoob &
+Aysha wedding restored on the local GPU; a cloud fan-out foundation added
+2026-09-12.
 
 The authoritative product behavior remains in
 [`WEB_UI_SPEC.md`](WEB_UI_SPEC.md); the proven media settings remain in
 [`CURRENT_PIPELINE.md`](CURRENT_PIPELINE.md). This note maps implemented concepts
 to code and records the current boundary without claiming later phases.
+
+## Restoration milestone
+
+The pipeline has restored the entire **Yacoob & Aysha** wedding end to end on
+the local RTX PRO 6000: all 22 chapters (DVD 1: 15, DVD 2: 7), each processed as
+a chain of durable ~750-frame SeedVR2 units, validated, registered in the
+catalog, and delivered to the NAS. Details and throughput are in
+[`CURRENT_PIPELINE.md`](CURRENT_PIPELINE.md).
 
 ## Implemented
 
@@ -61,16 +72,66 @@ slice through the authenticated API and ran it through the queue worker and
 metric, and log events during the 339-second run. Authenticated HTTP Range
 delivery returned `206 Partial Content` for the completed output.
 
+## Cloud fan-out (foundation)
+
+Added 2026-09-12 (commit `9e7ccf5`). This is the substrate for running durable
+restoration units on rented RunPod GPUs instead of, or alongside, the single
+local card. It is deliberately a **standalone "Stage A"**: it can be proved end
+to end for a couple of dollars before any worker or database integration is
+written, so nothing here can disturb a running local restoration.
+
+- `lib/seedvr2_unit_args.sh` is the single source of truth for the SeedVR2
+  durable-unit argv. Both paths render their command from it — `pipeline_v3.sh`
+  locally (inside `docker run`) and the cloud path natively on a pod — so the
+  two can never drift. One builder, no fork.
+- `webapp/cloud/runpod_api.py` is a stdlib-only RunPod control-plane client:
+  pod CRUD over REST (`rest.runpod.io/v1`) and the GPU catalogue/stock over
+  GraphQL (`api.runpod.io/graphql`), plus the ssh/rsync plumbing to drive a pod.
+  It raises `RunpodError` instead of calling `sys.exit`, so it is safe to call
+  from inside the worker's venv later without a library killing the process.
+- `webapp/cloud/cli.py` is the standalone operator CLI: `offers`, `up`, `unit`,
+  `status`, `down`, `reap`. It rents a pod, provisions it, runs one unit, and
+  tears it down, touching neither the catalog database nor the worker. Every pod
+  is recorded in `webapp/data/cloud_pods.json` **before** the create call
+  returns, and teardown never depends on a clean exit.
+- `webapp/cloud/reaper.py` is the money-safety kill switch: it asks RunPod which
+  pods carry this project's `wedding-` name prefix and deletes them, independent
+  of the database and worker.
+- `docker/seedvr2-pod/` builds the pod image and provisioning scripts. Pods have
+  no Docker daemon, so the pod's own image *is* the SeedVR2 runtime that
+  `pipeline_v3.sh` would otherwise launch as a container.
+- `webapp/db/migrations/006_cloud_pods.sql` adds the `cloud_pods` ledger: one
+  row per pod ever created, written `state='creating'` before the create call
+  returns so a crash mid-call still leaves a trace, with the reaper reconciling
+  live pods against it and spend derived as rate × lifetime.
+- `scripts/test_slice_equivalence.sh` (with `scripts/compare_units.sh`) is the
+  slicing proof: stage-1 output is FFV1 with `-g 1`, so every frame is a
+  keyframe and a stream-copy slice cuts on an exact frame boundary. The test
+  compares per-frame decoded MD5s (CPU-only, no GPU) to prove that shipping a
+  pod only its unit's frames feeds SeedVR2 byte-identically to a whole-file read.
+
+**Not yet built:** the webapp worker does not schedule, launch, or reconcile
+pods, so there is no automatic local/cloud placement, no multi-pod fan-out of a
+single chapter, and no UI surface. The `cloud_pods` table and ledger exist, but
+the worker path that fills them is future work.
+
 ## Not implemented
 
-### Phase 3
+### Phase 3 (durable units landed; interactive pause still pending)
 
-There are no independently durable 750-frame restoration units yet. Therefore
-there is no real pause, paused state workflow, chunk checksum map, chunk-level
-resume, context-aware final assembly, or chunk-derived ETA. Existing completed
-major stages remain reusable after failure/restart, exactly as
-`pipeline_v3.sh` already supports. A running cancellation waits for the active
-major stage to finish.
+Durable ~750-frame units are now the worker's production default: `pipeline_v3.sh`
+runs each unit in its own SeedVR2 container, `assemble_units.sh` performs the
+context-aware final assembly, and completed units survive failure/restart. On
+restart the worker re-probes every finished unit before restoring anything new,
+so resume is unit-level rather than whole-stage, and the job's ETA is recomputed
+from measured per-unit throughput (with a conservative planning rate seeded for
+queued jobs). See `CURRENT_PIPELINE.md` and `webapp/README.md` for the measured
+behavior.
+
+What remains unimplemented from the original Phase 3 outline is **interactive
+pause and a paused-state workflow**: a running cancellation still waits for the
+active unit/stage boundary to finish rather than pausing, and there is no
+resumable "paused" state exposed in the UI.
 
 ### Phase 4
 

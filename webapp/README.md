@@ -5,9 +5,15 @@ This is the private chapter-based interface described in
 DVD ISOs, serves lightweight chapter review media, stores selections in SQLite,
 and runs the existing restoration pipeline through one host worker.
 
-Phase 1 and Phase 2 are implemented. Pause/resume is deliberately unavailable:
-until Phase 3 introduces independently durable restoration chunks, cancellation
-can only take effect after the current major `pipeline_v3.sh` stage finishes.
+Phase 1 and Phase 2 are implemented, and restoration now runs as durable
+~750-frame units (see "Progress, ETA, and worker health" below). Interactive
+pause/resume is still deliberately unavailable: cancellation takes effect only
+after the current `pipeline_v3.sh` unit/stage finishes. It has restored the
+complete Yacoob & Aysha wedding (all 22 chapters, both DVDs) on the local GPU.
+
+A **cloud fan-out foundation** (`webapp/cloud/`) can run individual units on
+rented RunPod GPUs, but it is standalone and CLI-driven today — the worker does
+not orchestrate pods (see "Cloud fan-out" below and `docs/ARCHITECTURE.md`).
 
 ## Folder layout
 
@@ -163,6 +169,39 @@ GPU-hours cost), and the queue page can hide finished and cancelled jobs.
 - A running cancellation writes a fixed worker control file. The current stage
   is allowed to finish, then `pipeline_v3.sh` exits at the boundary and releases
   GPU memory. There is no pause command in Phase 2.
+
+## Cloud fan-out (foundation, standalone)
+
+`webapp/cloud/` can offload a single durable unit to a rented RunPod GPU. It is
+**standalone Stage A**: it does not touch the catalog database or the running
+worker, so it can be exercised for a couple of dollars without any risk to a
+local restoration. Requirements: a RunPod API key in `webapp/data/runpod.env`
+and an SSH key under `cloud/keys/` (both gitignored).
+
+```bash
+# Show GPU offers and current stock, then rent, run one unit, and tear down.
+webapp/.venv/bin/python -m webapp.cloud.cli offers
+webapp/.venv/bin/python -m webapp.cloud.cli up --gpu "RTX PRO 6000"
+webapp/.venv/bin/python -m webapp.cloud.cli unit <pod> \
+  --input slice.mkv --output unit.mkv --skip 0 --cap 754 --prepend 0 --drop 4
+webapp/.venv/bin/python -m webapp.cloud.cli status
+webapp/.venv/bin/python -m webapp.cloud.cli down --all
+```
+
+Every pod is recorded in `webapp/data/cloud_pods.json` before the create call
+returns, and teardown never depends on a clean exit. Because a running pod bills
+real money, there is a database-independent kill switch that terminates anything
+carrying this project's `wedding-` pod-name prefix:
+
+```bash
+webapp/.venv/bin/python -m webapp.cloud.reaper --dry-run   # list what we own
+webapp/.venv/bin/python -m webapp.cloud.reaper --yes       # terminate them all
+```
+
+The unit argv is shared with the local pipeline via `lib/seedvr2_unit_args.sh`,
+and `scripts/test_slice_equivalence.sh` proves (CPU-only) that a stream-copy
+slice feeds SeedVR2 byte-identically to a whole-file read. The worker does not
+yet schedule or reconcile pods; that integration is future work.
 
 ## systemd and Docker later
 

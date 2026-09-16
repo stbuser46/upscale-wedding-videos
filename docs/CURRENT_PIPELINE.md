@@ -1,6 +1,8 @@
 # Current restoration pipeline
 
-Status: proven on an 18-second midpoint sample on 2026-08-03.
+Status: proven on an 18-second midpoint sample on 2026-08-03, then run to
+completion across the entire Yacoob & Aysha wedding (all 22 chapters, both DVDs)
+on the local RTX PRO 6000 — see "Full wedding restored" below.
 
 This document records what was investigated, what was changed, the successful
 settings, measured performance, known limitations, and which files matter.
@@ -208,6 +210,29 @@ saves the result. Run-to-run determinism of the pipeline was proven
 byte-identical on 2026-08-30; a formal cold-versus-warm decoded-hash
 comparison is staged in `work/verifycache/` and still pending a free GPU
 window.
+
+## Full wedding restored (production milestone)
+
+The 18-second reference above was the proof; the pipeline has since restored the
+**entire Yacoob & Aysha wedding end to end on the local RTX PRO 6000**:
+
+- **DVD 1 — 15 / 15 chapters** restored;
+- **DVD 2 — 7 / 7 chapters** restored;
+- 22 chapters total, each processed as a chain of durable ~750-frame SeedVR2
+  units through the webapp worker, validated (exact frame count, 10-bit HEVC,
+  48 kHz FLAC), and registered in the catalog.
+
+The restored per-chapter masters live under `webapp/data/outputs/`
+(`restore-<id>.mkv`, ~85 GB total) and have been delivered to the NAS as
+`DVDn - Chapter NN - Restored HD.mkv` under
+`nas.home:/volume1/Movies/WeddingFilm/Yacoob And Aysha/`, replacing the earlier
+"DVD quality" stopgaps. This is the first complete disc-set restoration and the
+basis for treating the pipeline as production-proven rather than reference-only.
+
+Sustained throughput in durable-unit production settled around 0.85–0.88 output
+fps with the persistent compile cache (see the 2026-09-08 update above), i.e.
+roughly a week of GPU time per full DVD — the motivation for the cloud fan-out
+foundation documented in `docs/ARCHITECTURE.md`.
 
 ## Output inventory
 
