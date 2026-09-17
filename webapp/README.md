@@ -153,6 +153,18 @@ re-queued; queueing an already-restored chapter asks for confirmation first.
 Chapters can be sorted shortest- or longest-first (each card shows an estimated
 GPU-hours cost), and the queue page can hide finished and cancelled jobs.
 
+### Previews tab
+
+`/previews` plays short before/after review clips (used to validate a recipe
+before committing GPU time). It is data-driven from
+`webapp/data/previews/manifest.json` — a list of `sets`, each with `clips` of
+`{file, label, note}`. Clip files live in `webapp/data/previews/` and are served
+same-origin by `GET /previews/media/<file>` with HTTP Range support; only files
+that exist on disk are shown, so a partial or missing manifest degrades to an
+empty page. To add a source, drop browser-safe `.mp4`s in that folder and append
+a set to the manifest — the route reads it per request, so no restart is needed.
+(`scripts/vhs_preview.sh` generates the VHS clips.)
+
 ## Operational behavior
 
 - The browser never supplies a filesystem path, tag, image name, or shell

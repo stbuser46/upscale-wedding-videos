@@ -235,3 +235,14 @@ dl dd { margin: 5px 0 0; overflow-wrap: anywhere; }
 .cloud-stat span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
 .cloud-error { margin: 0; color: #8c342e; font-size: 12px; line-height: 1.4; background: #f5e4e1; border-radius: 8px; padding: 8px 10px; }
 .cloud-local-note { font-size: 13px; margin: 6px 0 0; }
+
+/* Restoration previews (previews page) */
+.preview-set { margin-top: 40px; }
+.preview-set .section-heading { margin-bottom: 20px; }
+.preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 22px; }
+.preview-card { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; box-shadow: var(--shadow); }
+.preview-card .video-shell { border-radius: 0; max-height: none; }
+.preview-card figcaption { padding: 14px 18px; display: flex; flex-direction: column; gap: 3px; }
+.preview-card figcaption strong { font-weight: 600; }
+.preview-card figcaption span { font-size: 13px; }
+.preview-empty { margin-top: 30px; }

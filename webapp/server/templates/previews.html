@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Previews · Wedding Film Restoration{% endblock %}
+{% block content %}
+<section class="title-heading">
+  <p class="eyebrow">Restoration previews</p>
+  <h1>Before / after review clips</h1>
+  <p class="muted">Short samples used to validate a recipe before committing GPU time. Tap a clip to load and play it.</p>
+</section>
+{% if not sets %}
+<section class="preview-empty"><p class="muted">No previews are available yet.</p></section>
+{% endif %}
+{% for set in sets %}
+<section class="preview-set">
+  <div class="section-heading"><div>
+    {% if set.subtitle %}<p class="eyebrow">{{ set.subtitle }}</p>{% endif %}
+    <h2>{{ set.title }}</h2>
+  </div></div>
+  <div class="preview-grid">
+    {% for clip in set.clips %}
+    <figure class="preview-card">
+      <div class="video-shell">
+        <video class="visible" controls preload="none" playsinline
+               src="{{ url_for('preview_media', name=clip.file) }}"></video>
+      </div>
+      <figcaption>
+        <strong>{{ clip.label }}</strong>
+        {% if clip.note %}<span class="muted">{{ clip.note }}</span>{% endif %}
+      </figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% endblock %}

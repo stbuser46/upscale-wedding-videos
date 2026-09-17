@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import mimetypes
 import os
 from pathlib import Path
 import secrets
@@ -128,6 +130,56 @@ def create_app(settings: Settings | None = None) -> Flask:
         if exists is None:
             abort(404, description="Job not found")
         return render_template("job.html", page="queue", public_id=public_id)
+
+    @app.get("/previews")
+    def previews():
+        # Before/after review clips, driven by data/previews/manifest.json so new
+        # sets (VHS sources, full restores) drop in without code changes. Each
+        # clip file is served same-origin by preview_media below (CSP media-src
+        # 'self'); only files that actually exist under the previews dir are shown.
+        previews_dir = (settings.data_dir / "previews").resolve()
+        manifest_path = previews_dir / "manifest.json"
+        sets: list[dict] = []
+        if manifest_path.is_file():
+            try:
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                raw_sets = data.get("sets", []) if isinstance(data, dict) else []
+            except (ValueError, OSError):
+                raw_sets = []
+            for entry in raw_sets:
+                if not isinstance(entry, dict):
+                    continue
+                clips = []
+                for clip in entry.get("clips", []):
+                    name = isinstance(clip, dict) and clip.get("file")
+                    if not name:
+                        continue
+                    candidate = (previews_dir / name).resolve()
+                    if candidate.is_relative_to(previews_dir) and candidate.is_file():
+                        clips.append(clip)
+                if clips:
+                    sets.append(
+                        {
+                            "title": entry.get("title", ""),
+                            "subtitle": entry.get("subtitle", ""),
+                            "clips": clips,
+                        }
+                    )
+        return render_template("previews.html", page="previews", sets=sets)
+
+    @app.get("/previews/media/<path:name>")
+    def preview_media(name: str):
+        previews_dir = (settings.data_dir / "previews").resolve()
+        path = (previews_dir / name).resolve()
+        if not path.is_relative_to(previews_dir) or not path.is_file():
+            abort(404, description="Preview media not found")
+        mime, _ = mimetypes.guess_type(path.name)
+        return send_file(
+            path,
+            mimetype=mime or "application/octet-stream",
+            conditional=True,
+            download_name=path.name,
+        )
 
     @app.get("/media/<int:artifact_id>")
     def media(artifact_id: int):
