@@ -1,0 +1,14 @@
+[Unit]
+Description=Sweep for orphaned wedding cloud pods every 10 minutes
+Documentation=man:webapp.cloud.reaper
+
+[Timer]
+# First sweep shortly after boot (catch pods orphaned by a crash/power loss),
+# then every 10 minutes. Persistent=true runs a missed sweep after downtime.
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

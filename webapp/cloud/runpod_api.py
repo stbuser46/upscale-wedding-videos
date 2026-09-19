@@ -156,7 +156,12 @@ class RunpodClient:
 
     # ---------------------------------------------------------------- transport
 
-    def _send(self, req: urllib.request.Request, *, what: str) -> Any:
+    def _send(self, req: urllib.request.Request, *, what: str, idempotent: bool = True) -> Any:
+        # `idempotent=False` (a side-effecting POST like pod creation) must NOT be
+        # retried on a timeout or 5xx: the request may well have SUCCEEDED on the
+        # server with the response lost in transit, and a blind retry would create
+        # a SECOND billable pod. Such calls fail fast so the caller can reconcile
+        # by listing (dedupe-by-name) before deciding to try again.
         last: Exception | None = None
         for attempt in range(self.retries):
             try:
@@ -165,14 +170,14 @@ class RunpodClient:
                     return json.loads(body) if body else None
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:800]
-                if exc.code in RETRY_STATUS and attempt < self.retries - 1:
+                if idempotent and exc.code in RETRY_STATUS and attempt < self.retries - 1:
                     last = RunpodError(f"{what}: HTTP {exc.code}: {detail}")
                     time.sleep(2**attempt)
                     continue
                 raise RunpodError(f"{what}: HTTP {exc.code}: {detail}") from exc
             except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
                 last = RunpodError(f"{what}: {exc}")
-                if attempt < self.retries - 1:
+                if idempotent and attempt < self.retries - 1:
                     time.sleep(2**attempt)
                     continue
                 raise last from exc
@@ -189,7 +194,9 @@ class RunpodClient:
                 "User-Agent": USER_AGENT,
             },
         )
-        return self._send(req, what=f"{method} {path}")
+        # POST creates a pod — a non-idempotent side effect. GET/DELETE/PUT are
+        # safe to retry (DELETE is idempotent; a re-GET is harmless).
+        return self._send(req, what=f"{method} {path}", idempotent=(method != "POST"))
 
     def _graphql(self, query: str, variables: dict | None = None) -> Any:
         payload: dict[str, Any] = {"query": query}
@@ -349,14 +356,34 @@ class RunpodClient:
     def our_pods(self) -> list[dict]:
         return [p for p in self.list_pods() if (p.get("name") or "").startswith(POD_NAME_PREFIX)]
 
+    def pod_by_name(self, name: str) -> dict | None:
+        """Find a live (non-terminal) pod by its exact name, newest first.
+
+        Pod names are unique per (job, slot), so this is how a create is made
+        idempotent: if a prior POST actually created the pod but its response was
+        lost, the retry finds it here and adopts it instead of creating a twin.
+        """
+        matches = [
+            p for p in self.list_pods()
+            if (p.get("name") or "") == name
+            and str(p.get("desiredStatus") or p.get("status") or "").upper() not in TERMINAL_POD_STATUS
+        ]
+        matches.sort(key=lambda p: str(p.get("createdAt") or p.get("id") or ""), reverse=True)
+        return matches[0] if matches else None
+
     def terminate_pod(self, pod_id: str) -> bool:
-        """Delete a pod so it stops billing. Idempotent: a pod that is already
-        gone counts as success, because the caller's goal is 'not billing'."""
+        """Delete a pod so it stops billing. Returns True only when the pod is
+        CONFIRMED gone — a 2xx delete or a 404 (already gone). Any other error
+        (including 400, a 5xx, or a network failure) raises, because the pod may
+        STILL BE BILLING and the caller must not record it as terminated. A 400
+        used to be swallowed as success, which could hide a live, billing pod.
+        DELETE is idempotent, so `_rest` still retries transient failures."""
         try:
             self._rest("DELETE", f"/pods/{pod_id}")
             return True
         except RunpodError as exc:
-            if "HTTP 404" in str(exc) or "HTTP 400" in str(exc):
+            text = str(exc).lower()
+            if "http 404" in text or "not found" in text or "does not exist" in text:
                 return True
             raise
 

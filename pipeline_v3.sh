@@ -61,6 +61,18 @@ FORCE=${FORCE:-0}
 # which the GPU sits idle. SKIP_BASELINE=1 omits it for unattended production
 # runs (quality of the restored result is unaffected). Default 0 keeps prior behaviour.
 SKIP_BASELINE=${SKIP_BASELINE:-0}
+# Stage-1 deinterlace / source profile. Defaults reproduce the original
+# PAL/BFF behaviour exactly (bottom-field-first, 768x576 square pixels, 50p,
+# bt470bg). The worker overrides these per disc: NTSC needs 640x480, 59.94p and
+# smpte170m; a top-field-first disc (e.g. Mo) needs DEINT_PARITY=tff. Getting
+# parity wrong reverses fields and judders motion, so these are data-driven.
+DEINT_PARITY=${DEINT_PARITY:-bff}
+DEINT_SCALE=${DEINT_SCALE:-768:576}
+DEINT_FPS=${DEINT_FPS:-50}
+DEINT_IN_MATRIX=${DEINT_IN_MATRIX:-bt470bg}
+DEINT_CS=${DEINT_CS:-bt470bg}
+DEINT_PRIMARIES=${DEINT_PRIMARIES:-bt470bg}
+DEINT_TRC=${DEINT_TRC:-gamma28}
 WORK_ROOT=${PIPELINE_WORK_ROOT:-$PROJ/work}
 CONTROL_FILE=${PIPELINE_CONTROL_FILE:-}
 FREE_SPACE_RESERVE_BYTES=${PIPELINE_FREE_SPACE_RESERVE_BYTES:-0}
@@ -186,7 +198,7 @@ check_cancel "prepare_50p"
 check_free_space "prepare_50p"
 emit_event "stage_start" "prepare_50p"
 if [[ ! -s "$DEINTERLACED" ]]; then
-  echo "[1/4] BFF PAL -> square-pixel 768x576 50p FFV1"
+  echo "[1/4] ${DEINT_PARITY^^} field-split -> square-pixel ${DEINT_SCALE} ${DEINT_FPS}fps FFV1 (${DEINT_CS})"
   rm -f "$DEINTERLACED_PART"
   docker run --rm \
     "${PROJECT_MOUNTS[@]}" \
@@ -194,9 +206,9 @@ if [[ ! -s "$DEINTERLACED" ]]; then
     -hide_banner -loglevel warning -stats -y \
     -ss "$SS" -t "$DUR" -i "/proj/${INPUT#"$PROJ/"}" \
     -map 0:v:0 -an \
-    -vf "bwdif=mode=send_field:parity=bff,scale=768:576:in_range=tv:in_color_matrix=bt470bg:flags=lanczos,setsar=1" \
-    -r 50 -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -pix_fmt yuv444p \
-    -colorspace bt470bg -color_primaries bt470bg -color_trc gamma28 -color_range tv \
+    -vf "bwdif=mode=send_field:parity=${DEINT_PARITY},scale=${DEINT_SCALE}:in_range=tv:in_color_matrix=${DEINT_IN_MATRIX}:flags=lanczos,setsar=1" \
+    -r "$DEINT_FPS" -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -pix_fmt yuv444p \
+    -colorspace "$DEINT_CS" -color_primaries "$DEINT_PRIMARIES" -color_trc "$DEINT_TRC" -color_range tv \
     "/proj/${DEINTERLACED_PART#"$PROJ/"}"
   mv -f "$DEINTERLACED_PART" "$DEINTERLACED"
 else
@@ -291,7 +303,7 @@ elif [[ ! -s "$BASELINE" ]]; then
     --entrypoint ffmpeg upscaler-cuda:latest \
     -hide_banner -loglevel warning -stats -y \
     -i "/proj/${DEINTERLACED#"$PROJ/"}" \
-    -vf "scale=1920:1440:in_range=tv:out_range=tv:in_color_matrix=bt470bg:out_color_matrix=bt709:flags=lanczos,format=yuv420p10le" \
+    -vf "scale=1920:1440:in_range=tv:out_range=tv:in_color_matrix=${DEINT_IN_MATRIX}:out_color_matrix=bt709:flags=lanczos,format=yuv420p10le" \
     -an -c:v libx265 -preset slow -crf 14 \
     -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
     "/proj/${BASELINE_PART#"$PROJ/"}"

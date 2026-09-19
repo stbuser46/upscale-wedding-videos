@@ -74,6 +74,8 @@ class CloudFleet:
         self._cache_lock = threading.Lock()
         self._ready = 0
         self._requested = 0
+        self._capped = False                       # spend cap tripped -> fleet torn down
+        self._monitor: threading.Thread | None = None
 
     # ---------------------------------------------------------------- ledger
 
@@ -128,6 +130,51 @@ class CloudFleet:
                                  name=f"fleet-pod-{i}")
             t.start()
             self._threads.append(t)
+        # The spend cap is only meaningful if something enforces it WHILE pods
+        # run, not just at bring-up: N pods that all launched under the cap then
+        # bill for hours would blow past it unchecked. This watchdog is that
+        # enforcement — it tears the whole fleet down the moment accrued spend
+        # reaches the cap, and retires any pod that has gone too long without
+        # finishing a unit (wedged/forgotten).
+        if self._monitor is None:
+            self._monitor = threading.Thread(target=self._watchdog, daemon=True,
+                                              name="fleet-watchdog")
+            self._monitor.start()
+
+    @property
+    def capped(self) -> bool:
+        """True once the spend cap tripped and the fleet was torn down."""
+        return self._capped
+
+    def _watchdog(self, poll: float = 15.0) -> None:
+        while not self._stop.wait(poll):
+            # 1) Hard spend cap: accrued cost across every pod this job has ever
+            #    created (running ones counted to 'now'). This is the real
+            #    ceiling — bring-up alone can't bound it.
+            try:
+                spent = self.spend_so_far()
+            except Exception as exc:  # never let a DB blip disable the guard silently
+                self.log(f"[fleet] WARN watchdog spend check failed: {exc}")
+                spent = 0.0
+            if spent >= self.cfg.spend_cap_usd:
+                self._capped = True
+                self.log(f"[fleet] SPEND CAP ${self.cfg.spend_cap_usd:.2f} reached "
+                         f"(accrued ${spent:.2f}); tearing down the whole fleet NOW")
+                self.terminate_all()
+                return
+            # 2) TTL backstop: retire a pod that has run `pod_ttl_s` without
+            #    finishing a unit. hand_back() refreshes the clock each completed
+            #    unit, so a healthy pod chewing through units never trips this;
+            #    only a wedged/forgotten pod does. (Per-unit timeout in the
+            #    executor is the finer guard; this catches the coarse case.)
+            now = time.monotonic()
+            with self._lock:
+                stale = [s for s in self._slots.values()
+                         if now - s.created_at > self.cfg.pod_ttl_s]
+            for slot in stale:
+                self.log(f"[fleet] pod {slot.pod_id} exceeded TTL "
+                         f"{self.cfg.pod_ttl_s:.0f}s without progress; retiring")
+                self.retire_slot(slot)
 
     def provisioning_done(self) -> bool:
         """True once every bring-up thread has finished (readied or failed)."""
@@ -140,7 +187,9 @@ class CloudFleet:
         out — NOT a fixed timeout. Returns None if `stop_check` fires or the fleet
         can never produce a slot (all bring-ups finished and none succeeded)."""
         while True:
-            if stop_check():
+            # A tripped spend cap or any teardown stops handing out work at once,
+            # so no new paid unit dispatches after the ceiling is hit.
+            if stop_check() or self._stop.is_set():
                 return None
             try:
                 return self.slot_queue.get(timeout=poll)
@@ -149,6 +198,13 @@ class CloudFleet:
                     no_live_slots = len(self._slots) == 0
                 if self.provisioning_done() and no_live_slots:
                     return None  # every pod failed to come up; give up
+
+    def hand_back(self, slot: "Slot") -> None:
+        """Return a healthy slot to the queue after it finished a unit, and
+        refresh its TTL clock — completing a unit is proof the pod is alive, so
+        the watchdog's 'no progress for pod_ttl_s' timer restarts here."""
+        slot.created_at = time.monotonic()
+        self.slot_queue.put(slot)
 
     def retire_slot(self, slot: "Slot") -> None:
         """Terminate a pod that has no more work, immediately, so it stops
@@ -233,22 +289,41 @@ class CloudFleet:
                      terminated_at=_now_iso())
 
     def _create_pod(self, name: str) -> dict:
-        """Create one pod, retrying create-time RunPod 500s a few times (each
-        retry lets RunPod pick a different machine)."""
-        last: Exception | None = None
-        for attempt in range(4):
-            if self._stop.is_set():
-                raise RunpodError("fleet stopping")
+        """Create ONE pod, idempotently by name.
+
+        Pod creation is a non-idempotent POST: if RunPod created the pod but the
+        response was lost, a blind retry would rent a SECOND billable GPU. So the
+        transport does not retry the POST (runpod_api marks it non-idempotent),
+        and here we bracket the single create with a name lookup: adopt a pod
+        that already carries this name (a prior attempt that actually landed)
+        rather than create a twin. The outer `_bring_up` loop provides the only
+        retry, so at most `bring_up_attempts` (3) creates ever fire per slot —
+        not the old 3x4x4 = up-to-48."""
+        if self._stop.is_set():
+            raise RunpodError("fleet stopping")
+        existing = self.client.pod_by_name(name)
+        if existing is not None:
+            self.log(f"[fleet] adopting existing pod {existing.get('id')} named {name}")
+            return existing
+        try:
+            return self.client.create_pod(
+                name=name, image=self.cfg.image, gpu_type_ids=self.cfg.gpu_type_ids,
+                public_key=self._pubkey, container_disk_gb=self.cfg.container_disk_gb,
+                cloud_type=self.cfg.cloud_type,
+            )
+        except RunpodError as exc:
+            # The POST may have created the pod despite the error (lost response).
+            # Reconcile by name before surfacing the failure, so we never leave a
+            # billing twin behind — and adopt it if it landed.
+            landed = None
             try:
-                return self.client.create_pod(
-                    name=name, image=self.cfg.image, gpu_type_ids=self.cfg.gpu_type_ids,
-                    public_key=self._pubkey, container_disk_gb=self.cfg.container_disk_gb,
-                    cloud_type=self.cfg.cloud_type,
-                )
-            except RunpodError as exc:
-                last = exc
-                time.sleep(4 + 4 * attempt)
-        raise last or RunpodError("create failed")
+                landed = self.client.pod_by_name(name)
+            except RunpodError:
+                pass
+            if landed is not None:
+                self.log(f"[fleet] create reported error but pod {landed.get('id')} landed; adopting")
+                return landed
+            raise exc
 
     def _cache_tarball(self) -> Path | None:
         """Pack the 9,070-file warm compile cache into ONE tarball, once, shared
@@ -324,10 +399,26 @@ class CloudFleet:
     # -------------------------------------------------------------- teardown
 
     def _terminate(self, pod_id: str, name: str) -> None:
+        """Delete a pod and record its fate HONESTLY.
+
+        Only mark the ledger row 'terminated' (with terminated_at set, which is
+        what stops spend_so_far counting it and drops it from the live UI) when
+        the delete is CONFIRMED — terminate_pod raises otherwise. On an
+        unconfirmed delete we leave the row 'terminating' with terminated_at
+        NULL, so: (a) spend_so_far keeps counting it — a conservative over-count
+        that can only trip the cap EARLIER, never hide cost; (b) it still shows
+        as live; (c) the reaper (independent systemd timer) and the next cloud
+        worker's reconcile will confirm and finalise it. The old code marked
+        every pod terminated even when DELETE threw, which could hide a pod that
+        was still billing."""
+        self._ledger(name, state="terminating")
         try:
-            self.client.terminate_pod(pod_id)
+            self.client.terminate_pod(pod_id)  # True or raises
         except RunpodError as exc:
-            self.log(f"[fleet] WARN terminate {pod_id} failed: {exc}")
+            self.log(f"[fleet] WARN terminate {pod_id} UNCONFIRMED ({exc}); "
+                     f"left 'terminating' for the reaper — may still be billing")
+            self._ledger(name, error=f"terminate unconfirmed: {str(exc)[:300]}")
+            return
         self._ledger(name, state="terminated", terminated_at=_now_iso())
 
     def terminate_all(self) -> None:

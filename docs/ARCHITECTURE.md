@@ -144,21 +144,58 @@ worker-wide — there is no per-job cloud toggle in the API or GUI.
   on the queue page. It degrades to `{"enabled": false}` on a database without
   the `cloud_pods` table, so local-only deployments are unaffected.
 
-**Money-safety follow-ups (do before relying on cloud mode):** teardown is
-guaranteed only on a *graceful* worker exit or restart — a `SIGKILL`/OOM/power
-loss can leave up to `WEDDING_CLOUD_MAX_SLOTS` pods billing until the reaper is
-run by hand, because the reaper is not yet scheduled on an independent timer.
-Set a RunPod **account-level spend limit** and/or a cron/systemd timer running
-`python -m webapp.cloud.reaper --yes` before enabling `WEDDING_EXECUTOR=cloud`.
-The `WEDDING_CLOUD_SPEND_CAP_USD` guard is checked only at pod bring-up, and
-`pod_ttl_s` is defined but not yet enforced at runtime.
+**Money-safety (hardened 2026-09-19, after an independent xhigh review before the
+first paid multi-pod run).** The blockers that review surfaced are fixed and
+unit-verified without a GPU/RunPod (see `verify_*` proofs):
+
+- **Hard spend cap.** `CloudFleet` runs a `_watchdog` thread that checks accrued
+  `spend_so_far()` against `WEDDING_CLOUD_SPEND_CAP_USD` *while pods run* and
+  tears the whole fleet down at the ceiling (`capped`) — not just at bring-up, so
+  N already-launched pods can no longer bill past the cap unchecked.
+- **Enforced TTL.** `pod_ttl_s` is now honoured: a pod that goes that long
+  without finishing a unit is retired. `hand_back()` refreshes the clock on each
+  completed unit, so a healthy pod chewing through units is never killed.
+- **Honest teardown.** `_terminate` marks a ledger row `terminated` (which stops
+  spend counting it) ONLY when the delete is confirmed; an unconfirmed delete
+  stays `terminating` with `terminated_at` NULL, so spend keeps counting and the
+  reaper finishes the job. `terminate_pod` treats only a 404/not-found as
+  success (a 400 no longer masquerades as "gone"). `_reconcile_cloud_pods`
+  reconciles the ledger against RunPod's live list rather than optimistically.
+- **Idempotent create.** Pod creation is a non-idempotent POST that is no longer
+  transport-retried; `_create_pod` adopts an existing pod by name before/after a
+  create, so a lost response can't rent a billing twin. Total creates per slot
+  ≤ `bring_up_attempts` (3), not the old 3×4×4.
+- **Bounded auto-resume.** Interrupted jobs auto-requeue at most
+  `MAX_AUTO_RESUMES` (3) via a persistent `jobs.auto_resume_count`, then park
+  `failed` — a crash loop can't rent fleets forever. Reset on human
+  start/resume/retry or completion.
+- **Reaper backstop.** `webapp/cloud/reaper.py` decouples the balance query from
+  the delete path (a GraphQL blip no longer blocks kills), gains `--loop` and an
+  age filter (`--max-age-hours`), and ships as an age-filtered systemd timer
+  (`wedding-reaper.timer`, >4h) that catches true orphans without touching a
+  healthy in-progress fleet. Still set a RunPod account-level spend limit as the
+  final backstop.
+
+**Cross-GPU correctness fix:** the cloud slicer no longer hardcodes 50 fps — it
+takes the job's real `output_fps`, so NTSC (59.94) units slice on the correct
+frame boundary. The old default silently shipped shifted footage that frame-count
+validation could not catch (only unit 0 was correct — which is why the single-
+unit smoke test passed). `test_slice_equivalence.sh` now derives fps from the
+input and proves interior NTSC units are frame-exact.
+
+**Concurrency:** local and cloud workers hold separate locks and take a renewable
+per-job lease (`jobs.lease_expires_at`, renewed by a background thread). Recovery
+requeues only jobs whose lease is stale, so a second worker can no longer requeue
+and double-run the job a live worker still owns. **Operational note:** because a
+pre-lease (old-code) worker writes no lease, restart the local worker onto this
+code *before* starting a cloud worker beside it, or the cloud worker's recovery
+will treat the local job as unleased.
 
 **Not yet built:** no per-job or in-GUI choice of executor (it is a worker-wide
-env var), no automatic local↔cloud placement or cost-based scheduling, no
-per-unit retry (one failed unit fails the run), and no mixed local+cloud
-execution within one job. The cloud path is also **not yet live-verified against
-real pods** — the fixes to the resume ledger, tail-slice tolerance, and bad-pod
-retirement are code-reviewed but await a paid end-to-end run.
+env var), and no automatic local↔cloud placement or cost-based scheduling. The
+cloud path's money-safety and slicing fixes are unit-verified but **not yet
+re-verified end-to-end against real pods** — a cheap interior-unit (skip>0) NTSC
+run is the remaining live check before a full paid fan-out.
 
 ## Not implemented
 

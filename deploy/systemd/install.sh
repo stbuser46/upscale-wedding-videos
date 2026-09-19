@@ -17,6 +17,8 @@ echo "==> Installing unit files to $UNIT_DIR"
 mkdir -p "$UNIT_DIR"
 cp "$PROJ/deploy/systemd/wedding-web.service" "$UNIT_DIR/"
 cp "$PROJ/deploy/systemd/wedding-worker.service" "$UNIT_DIR/"
+cp "$PROJ/deploy/systemd/wedding-reaper.service" "$UNIT_DIR/"
+cp "$PROJ/deploy/systemd/wedding-reaper.timer" "$UNIT_DIR/"
 
 echo "==> Removing @reboot start-all.sh cron entry (if present)"
 if crontab -l 2>/dev/null | grep -q 'start-all.sh'; then
@@ -41,9 +43,21 @@ echo "==> Reloading and enabling user services"
 systemctl --user daemon-reload
 systemctl --user enable --now wedding-web.service
 systemctl --user enable --now wedding-worker.service
+# Money-safety backstop: an age-filtered reaper timer that only kills pods older
+# than 4h, so it never touches a healthy in-progress cloud fleet — it just
+# catches true orphans a crashed/power-lost worker left billing. Harmless when
+# no cloud pods exist. Only meaningful once runpod.env holds an API key.
+if [[ -f "$PROJ/webapp/data/runpod.env" ]]; then
+  systemctl --user enable --now wedding-reaper.timer
+  echo "    reaper timer enabled (orphan sweep every 10 min, >4h age filter)"
+else
+  echo "    reaper timer installed but NOT enabled (no webapp/data/runpod.env yet)."
+  echo "    enable later with: systemctl --user enable --now wedding-reaper.timer"
+fi
 
 echo "==> Status"
 systemctl --user --no-pager --lines=0 status wedding-web.service wedding-worker.service || true
+systemctl --user --no-pager list-timers wedding-reaper.timer 2>/dev/null || true
 echo "Done. Follow logs with:"
 echo "  journalctl --user -u wedding-worker.service -f"
 echo "  journalctl --user -u wedding-web.service -f"

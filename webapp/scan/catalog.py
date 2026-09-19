@@ -147,21 +147,27 @@ def scan_disc(settings: Settings, iso: Path) -> int:
         raise ScanError(f"Configured ISO is missing: {iso}")
     migrate(settings.database_path)
     now = utc_now()
-    slug = f"dvd{settings.iso_names.index(iso.name) + 1}"
+    spec = settings.spec_for(iso.name)
+    slug = spec.slug
     fingerprint = _iso_fingerprint(iso)
     with connect(settings.database_path) as db, transaction(db):
         db.execute(
             """INSERT INTO discs
                (slug, source_filename, source_path, size_bytes, fingerprint,
+                collection, video_standard, field_order,
                 scan_status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'scanning', ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'scanning', ?, ?)
                ON CONFLICT(slug) DO UPDATE SET
                  source_filename=excluded.source_filename,
                  source_path=excluded.source_path,
                  size_bytes=excluded.size_bytes,
                  fingerprint=excluded.fingerprint,
+                 collection=excluded.collection,
+                 video_standard=excluded.video_standard,
+                 field_order=excluded.field_order,
                  scan_status='scanning', scan_error=NULL, updated_at=excluded.updated_at""",
-            (slug, iso.name, str(iso), iso.stat().st_size, fingerprint, now, now),
+            (slug, iso.name, str(iso), iso.stat().st_size, fingerprint,
+             spec.collection, spec.standard, spec.field_order, now, now),
         )
         disc_id = db.execute("SELECT id FROM discs WHERE slug = ?", (slug,)).fetchone()["id"]
     try:
@@ -462,8 +468,9 @@ def generate_review_media(
     params: list[object] = []
     where = "WHERE c.priority != 'skip' AND t.likely_menu=0"
     if disc_slug:
-        if disc_slug not in {"dvd1", "dvd2"}:
-            raise ScanError("Disc must be dvd1 or dvd2")
+        known_slugs = {spec.slug for spec in settings.disc_specs}
+        if disc_slug not in known_slugs:
+            raise ScanError(f"Unknown disc slug {disc_slug!r}; known: {sorted(known_slugs)}")
         where += " AND d.slug=?"
         params.append(disc_slug)
     query = f"""SELECT c.id AS chapter_id, c.title_id, c.chapter_number,
@@ -483,9 +490,9 @@ def generate_review_media(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Scan fixed wedding DVD ISOs and create review media")
-    parser.add_argument("--scan", action="store_true", help="scan both configured ISOs")
+    parser.add_argument("--scan", action="store_true", help="scan all staged ISOs in source/")
     parser.add_argument("--proxies", action="store_true", help="generate chapter proxies and thumbnails")
-    parser.add_argument("--disc", choices=("dvd1", "dvd2"), help="limit proxy generation")
+    parser.add_argument("--disc", help="limit proxy generation to one disc slug (e.g. gulfraz1)")
     parser.add_argument("--limit", type=int, help="limit proxy count for a verification run")
     parser.add_argument("--force", action="store_true", help="regenerate existing review media")
     args = parser.parse_args(argv)

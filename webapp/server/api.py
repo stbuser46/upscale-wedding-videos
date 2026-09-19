@@ -456,7 +456,7 @@ def start_job(public_id: str):
         if job["state"] != "queued":
             abort(409, description=f"Only queued jobs can start; current state is {job['state']}")
         if not job["start_requested"]:
-            db.execute("UPDATE jobs SET start_requested=1, updated_at=? WHERE id=?", (utc_now(), job["id"]))
+            db.execute("UPDATE jobs SET start_requested=1, auto_resume_count=0, updated_at=? WHERE id=?", (utc_now(), job["id"]))
             append_event(db, job["id"], "command", state="queued", message="Start requested")
     return jsonify({"status": "start_requested"})
 
@@ -492,7 +492,7 @@ def resume_job(public_id: str):
         state = job["state"]
         if state == "paused":
             db.execute(
-                "UPDATE jobs SET state='queued', start_requested=1, updated_at=? WHERE id=?",
+                "UPDATE jobs SET state='queued', start_requested=1, auto_resume_count=0, updated_at=? WHERE id=?",
                 (utc_now(), job["id"]),
             )
             append_event(db, job["id"], "state", state="queued", message="Resumed; will continue from the first unfinished unit")
@@ -548,7 +548,8 @@ def retry_job(public_id: str):
             abort(409, description=f"Target already has active job {active['public_id']}")
         db.execute(
             """UPDATE jobs SET state='queued', start_requested=0, stage=NULL, error=NULL,
-               frames_done=0, fps=NULL, eta_seconds=NULL, completed_at=NULL, updated_at=? WHERE id=?""",
+               frames_done=0, fps=NULL, eta_seconds=NULL, completed_at=NULL,
+               auto_resume_count=0, lease_expires_at=NULL, updated_at=? WHERE id=?""",
             (utc_now(), job["id"]),
         )
         append_event(db, job["id"], "state", state="queued", message="Retry queued; completed major stages will be reused")

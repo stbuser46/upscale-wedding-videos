@@ -25,9 +25,34 @@ class QueueError(Exception):
         self.message = message
 
 
-def build_job_snapshot() -> dict[str, Any]:
+def deinterlace_profile(video_standard: str | None, field_order: str | None) -> dict[str, Any]:
+    """Map a disc's broadcast standard + field order to the stage-1 deinterlace
+    parameters (pipeline_v3.sh DEINT_* env) and the true progressive output fps.
+    Defaults reproduce the original PAL/BFF behaviour."""
+    parity = (field_order or "bff").lower()
+    if (video_standard or "pal").lower() == "ntsc":
+        # 720x480 29.97i -> square-pixel 640x480, 59.94p, SMPTE-170M.
+        return {
+            "parity": parity, "scale": "640:480", "fps": "60000/1001",
+            "in_matrix": "smpte170m", "cs": "smpte170m",
+            "primaries": "smpte170m", "trc": "smpte170m",
+            "output_fps": 60000 / 1001,
+        }
+    # PAL 720x576 25i -> square-pixel 768x576, 50p, bt470bg.
+    return {
+        "parity": parity, "scale": "768:576", "fps": "50",
+        "in_matrix": "bt470bg", "cs": "bt470bg",
+        "primaries": "bt470bg", "trc": "gamma28",
+        "output_fps": 50.0,
+    }
+
+
+def build_job_snapshot(video_standard: str | None = None, field_order: str | None = None) -> dict[str, Any]:
     """The pinned SeedVR2 settings recorded on every job. Single source of truth
-    shared by the interactive API and the automatic backlog reconciler."""
+    shared by the interactive API and the automatic backlog reconciler. The
+    per-disc deinterlace profile + true output_fps ride here so the worker and
+    pipeline handle NTSC / top-field-first discs correctly (defaults = PAL/BFF)."""
+    profile = deinterlace_profile(video_standard, field_order)
     return {
         "pipeline": "v3",
         "model": "seedvr2_ema_3b_fp16.safetensors",
@@ -35,8 +60,15 @@ def build_job_snapshot() -> dict[str, Any]:
         "batch": 129,
         "chunk": 750,
         "overlap": 4,
-        "output_fps": 50,
+        "output_fps": profile["output_fps"],
         "cancel_semantics": "stage_boundary",
+        "video_standard": (video_standard or "pal").lower(),
+        "field_order": profile["parity"],
+        "deinterlace": {
+            "parity": profile["parity"], "scale": profile["scale"], "fps": profile["fps"],
+            "in_matrix": profile["in_matrix"], "cs": profile["cs"],
+            "primaries": profile["primaries"], "trc": profile["trc"],
+        },
     }
 
 
@@ -47,7 +79,8 @@ def resolve_target(db: sqlite3.Connection, target_type: str, target_id: int) -> 
         row = db.execute(
             """SELECT c.id, c.title_id, c.start_ms, c.end_ms,
                       COALESCE(c.user_label, c.generated_label) AS display_name,
-                      c.priority, d.slug, t.title_number, t.source_cache_path
+                      c.priority, d.slug, t.title_number, t.source_cache_path,
+                      d.video_standard, d.field_order
                FROM chapters c JOIN titles t ON t.id=c.title_id
                JOIN discs d ON d.id=t.disc_id WHERE c.id=?""",
             (target_id,),
@@ -57,7 +90,8 @@ def resolve_target(db: sqlite3.Connection, target_type: str, target_id: int) -> 
     elif target_type == "slice":
         row = db.execute(
             """SELECT s.id, s.title_id, s.start_ms, s.end_ms, s.name AS display_name,
-                      s.priority, d.slug, t.title_number, t.source_cache_path
+                      s.priority, d.slug, t.title_number, t.source_cache_path,
+                      d.video_standard, d.field_order
                FROM slices s JOIN titles t ON t.id=s.title_id
                JOIN discs d ON d.id=t.disc_id WHERE s.id=?""",
             (target_id,),
@@ -83,7 +117,8 @@ def insert_job(db, settings, target: dict, target_type: str, target_id: int, pos
     the duplicate check (the partial unique index is the final guard)."""
     public_id = f"restore-{uuid.uuid4().hex[:12]}"
     duration_ms = target["end_ms"] - target["start_ms"]
-    snapshot = build_job_snapshot()
+    snapshot = build_job_snapshot(target.get("video_standard"), target.get("field_order"))
+    frames_total = round(duration_ms / 1000 * snapshot["output_fps"])
     priority = PRIORITY_NAMES[target["priority"]]
     now = utc_now()
     output_path = settings.data_dir / "outputs" / f"{public_id}.mkv"
@@ -99,7 +134,7 @@ def insert_job(db, settings, target: dict, target_type: str, target_id: int, pos
         (
             public_id, target_type, target_id, target["title_id"], target["start_ms"],
             target["end_ms"], target["display_name"], json.dumps(snapshot, sort_keys=True),
-            priority, position, int(settings.auto_start_jobs), round(duration_ms / 20),
+            priority, position, int(settings.auto_start_jobs), frames_total,
             str(output_path), str(baseline_path), str(log_path), now, now,
         ),
     )

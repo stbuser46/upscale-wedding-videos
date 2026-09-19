@@ -14,12 +14,17 @@
 # comparing per-frame MD5s of the decoded video, which is CPU-only: it needs no
 # GPU and therefore cannot disturb a running restoration or trip the idle gate.
 #
-# Usage: scripts/test_slice_equivalence.sh [input.mkv]
+# Usage: scripts/test_slice_equivalence.sh [input.mkv] [fps]
+#
+# fps defaults to the input's real frame rate (50 for PAL 50p, 60000/1001≈59.94
+# for NTSC 59.94p). The slice seek is `-ss skip/fps`, so this MUST match the
+# stage-1 output rate or the cut lands on the wrong frame — the exact bug the
+# production slicer had when it hardcoded 50 for an NTSC job. Pass fps explicitly
+# to prove the failure mode (e.g. `... input.mkv 50` on an NTSC file must FAIL).
 set -euo pipefail
 
 PROJ=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 INPUT=${1:-$PROJ/work/verifycache/input_50p_ffv1.mkv}
-FPS=50
 WORK=$(mktemp -d /tmp/slice-equiv.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -28,7 +33,14 @@ if [[ ! -s "$INPUT" ]]; then
   exit 1
 fi
 
+RFR=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
+  -of default=noprint_wrappers=1:nokey=1 "$INPUT")
+# Default fps to the file's real rate (e.g. 60000/1001); allow an explicit
+# override as $2 so a mismatched rate can be exercised on purpose.
+FPS=${2:-$(awk -v r="$RFR" 'BEGIN{split(r,a,"/"); printf "%.6f", a[2]?a[1]/a[2]:a[1]}')}
+
 echo "input: $INPUT"
+echo "fps:   $FPS (input r_frame_rate=$RFR)"
 ffprobe -v error -select_streams v:0 \
   -show_entries stream=codec_name,pix_fmt,width,height,r_frame_rate \
   -of default=noprint_wrappers=1:nokey=0 "$INPUT"

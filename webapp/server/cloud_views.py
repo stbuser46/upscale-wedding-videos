@@ -24,9 +24,12 @@ from webapp.db import connect
 
 cloud = Blueprint("cloud", __name__, url_prefix="/api/cloud")
 
-# A pod is "active" (billable and doing useful work) while it is provisioned and
-# either warming up its model or actually restoring a unit.
-_ACTIVE_STATES = {"ready", "running"}
+# A pod BILLS from the moment it is created until it is confirmed terminated —
+# provisioning (apt/pip/7.3 GB weight pull, ~15 min) and an unconfirmed teardown
+# ('terminating' with no terminated_at) both cost money. Counting only
+# ready/running showed $0/h through the costliest warm-up window and hid a pod a
+# failed teardown left billing. So "billing" is simply: not confirmed dead.
+_BILLING_EXCLUDED_STATES = {"terminated"}
 
 
 def _settings():
@@ -103,9 +106,9 @@ def fleet():
 
     for row in rows:
         state = row["state"]
-        if state != "terminated":
+        is_billing = state not in _BILLING_EXCLUDED_STATES
+        if is_billing:
             enabled = True
-        is_active = state in _ACTIVE_STATES
 
         created = _parse_iso(row["created_at"])
         ended = _parse_iso(row["terminated_at"]) or now
@@ -115,7 +118,7 @@ def fleet():
         cost = (rate or 0.0) * lifetime_s / 3600.0
         spend_usd += cost
 
-        if is_active:
+        if is_billing:
             active += 1
             rate_per_hr += rate or 0.0
 
@@ -131,11 +134,11 @@ def fleet():
             "cost_usd": round(cost, 2),
             "error": row["error"],
             # Sort helpers (stripped before serialisation).
-            "_active": is_active,
+            "_active": is_billing,
             "_created": created.timestamp() if created else 0.0,
         })
 
-    # Active pods first, then most-recently-created first.
+    # Billing pods first, then most-recently-created first.
     pods.sort(key=lambda pod: (0 if pod["_active"] else 1, -pod["_created"]))
     for pod in pods:
         del pod["_active"]

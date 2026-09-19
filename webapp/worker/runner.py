@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import fcntl
 import json
 import os
@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, TypeVar
 
@@ -27,6 +28,21 @@ WRITTEN_RE = re.compile(r"Written\s+(\d+)/(\d+)\s+frames")
 CHUNK_RE = re.compile(r"Chunk\s+(\d+)/(\d+):")
 STREAM_COMPLETE_RE = re.compile(r"Streaming complete:\s+(\d+)\s+frames")
 ACTIVE_STATES = ("preparing", "running", "assembling", "cancel_requested", "pause_requested", "resuming")
+
+# Worker lease: the worker that owns a job renews jobs.lease_expires_at every
+# LEASE_RENEW_S seconds while it runs. Recovery requeues a job only when its
+# lease is STALE (expired or NULL), so a second worker (e.g. cloud starting
+# beside a running local worker) never steals a job a live worker still owns.
+# TTL is generously larger than the renew interval AND than the longest gap
+# between renewals (a background thread renews independent of work progress, so
+# even a 20-minute cloud unit stays fresh).
+LEASE_TTL_S = 240.0
+LEASE_RENEW_S = 45.0
+# Bounded auto-resume: recovery re-queues an interrupted job at most this many
+# times without a human. Past it the job is parked 'failed' so a repeatable
+# crash can't rent cloud fleets forever. Reset when a human starts/resumes/
+# retries the job, or when it completes.
+MAX_AUTO_RESUMES = 3
 
 # Returned by _run_pipeline when the worker was asked to shut down (SIGTERM,
 # e.g. `systemctl --user stop`) mid-run. The job is left in its active state so
@@ -164,22 +180,58 @@ class GpuLock:
         self.handle.close()
 
 
+def _lease_deadline() -> str:
+    """ISO timestamp LEASE_TTL_S in the future — a job's lease expiry."""
+    return (datetime.now(UTC) + timedelta(seconds=LEASE_TTL_S)).isoformat(timespec="milliseconds")
+
+
+def _renew_lease(settings: Settings) -> None:
+    """Push this worker's owned-job lease forward. Renewed by a background thread
+    on a fixed cadence, independent of work progress, so even a long (~20 min)
+    cloud unit keeps the lease fresh and no peer worker mistakes the job for
+    abandoned. Best-effort: a transient DB miss is harmless (TTL >> renew gap)."""
+    def op() -> None:
+        with connect(settings.database_path) as db, transaction(db):
+            db.execute(
+                f"""UPDATE jobs SET lease_expires_at=?
+                    WHERE worker_pid=? AND state IN ({','.join('?' for _ in ACTIVE_STATES)})""",
+                (_lease_deadline(), os.getpid(), *ACTIVE_STATES),
+            )
+    _best_effort(op)
+
+
+def _lease_renewer(settings: Settings, stop: "threading.Event") -> None:
+    while not stop.wait(LEASE_RENEW_S):
+        _renew_lease(settings)
+
+
 def _recover_interrupted(settings: Settings) -> None:
+    """Requeue jobs abandoned by a dead worker — but ONLY those whose lease has
+    gone stale. A job with a fresh lease is still owned by a live worker (its
+    background renewer keeps the lease current), so touching it would steal a
+    running job and let two workers write the same paths. Runs both at startup
+    and periodically, so a still-alive worker also reclaims a crashed peer's job.
+
+    Auto-resume is bounded: past MAX_AUTO_RESUMES the job is parked 'failed'
+    rather than requeued, so a repeatable crash cannot keep renting cloud pods.
+    """
     with connect(settings.database_path) as db, transaction(db):
+        now = utc_now()
         rows = db.execute(
-            f"SELECT * FROM jobs WHERE state IN ({','.join('?' for _ in ACTIVE_STATES)})",
-            ACTIVE_STATES,
+            f"""SELECT * FROM jobs
+                WHERE state IN ({','.join('?' for _ in ACTIVE_STATES)})
+                  AND (lease_expires_at IS NULL OR lease_expires_at < ?)""",
+            (*ACTIVE_STATES, now),
         ).fetchall()
         for job in rows:
             previous = job["state"]
-            now = utc_now()
             db.execute(
-                "UPDATE jobs SET state='interrupted', worker_pid=NULL, updated_at=? WHERE id=?",
+                "UPDATE jobs SET state='interrupted', worker_pid=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?",
                 (now, job["id"]),
             )
             append_event(
                 db, job["id"], "state", state="interrupted", stage=job["stage"],
-                message=f"Worker restarted while job was {previous}; completed major stages remain reusable",
+                message=f"Worker vanished while job was {previous} (lease stale); completed major stages remain reusable",
             )
             if previous == "cancel_requested":
                 db.execute(
@@ -187,12 +239,29 @@ def _recover_interrupted(settings: Settings) -> None:
                     (now, now, job["id"]),
                 )
                 append_event(db, job["id"], "state", state="cancelled", message="Cancellation completed during worker recovery")
+                continue
+            attempts = (job["auto_resume_count"] or 0) + 1
+            if attempts > MAX_AUTO_RESUMES:
+                db.execute(
+                    "UPDATE jobs SET state='failed', start_requested=0, "
+                    "error=?, completed_at=?, updated_at=? WHERE id=?",
+                    (f"Auto-resume limit ({MAX_AUTO_RESUMES}) reached after repeated interruptions; "
+                     f"start the job manually to try again.", now, now, job["id"]),
+                )
+                append_event(
+                    db, job["id"], "state", state="failed",
+                    message=f"Not auto-resumed: hit the {MAX_AUTO_RESUMES}-attempt cap "
+                            f"(guards against a crash loop renting cloud pods). Start manually to retry.",
+                )
             else:
                 db.execute(
-                    "UPDATE jobs SET state='queued', start_requested=1, updated_at=? WHERE id=?",
-                    (now, job["id"]),
+                    "UPDATE jobs SET state='queued', start_requested=1, auto_resume_count=?, updated_at=? WHERE id=?",
+                    (attempts, now, job["id"]),
                 )
-                append_event(db, job["id"], "state", state="queued", message="Interrupted job requeued for major-stage resume")
+                append_event(
+                    db, job["id"], "state", state="queued",
+                    message=f"Interrupted job requeued for major-stage resume (auto-resume {attempts}/{MAX_AUTO_RESUMES})",
+                )
 
 
 def _claim_next(settings: Settings):
@@ -207,11 +276,13 @@ def _claim_next(settings: Settings):
         if job is None:
             return None
         now = utc_now()
+        # Take the lease at the moment of claim so it is never NULL for a live
+        # job — the background renewer keeps it fresh from here on.
         updated = db.execute(
             """UPDATE jobs SET state='preparing', stage='worker_checks', worker_pid=?,
-               claimed_at=?, started_at=COALESCE(started_at, ?), updated_at=?
+               lease_expires_at=?, claimed_at=?, started_at=COALESCE(started_at, ?), updated_at=?
                WHERE id=? AND state='queued' AND start_requested=1""",
-            (os.getpid(), now, now, now, job["id"]),
+            (os.getpid(), _lease_deadline(), now, now, now, job["id"]),
         )
         if updated.rowcount != 1:
             return None
@@ -331,6 +402,30 @@ def _system_metrics(settings: Settings) -> dict[str, Any]:
     return payload
 
 
+def _output_fps(snapshot: dict) -> float:
+    """True progressive output fps for a job (50 for PAL, ~59.94 for NTSC).
+    Falls back to 50 for jobs whose snapshot predates the field."""
+    try:
+        return float(snapshot.get("output_fps") or 50.0)
+    except (TypeError, ValueError):
+        return 50.0
+
+
+def _deint_env(snapshot: dict) -> dict[str, str]:
+    """Per-disc stage-1 deinterlace overrides for pipeline_v3.sh. Empty for old
+    jobs whose snapshot predates the profile, so the pipeline keeps its PAL/BFF
+    defaults."""
+    d = snapshot.get("deinterlace") or {}
+    if not d:
+        return {}
+    return {
+        "DEINT_PARITY": str(d["parity"]), "DEINT_SCALE": str(d["scale"]),
+        "DEINT_FPS": str(d["fps"]), "DEINT_IN_MATRIX": str(d["in_matrix"]),
+        "DEINT_CS": str(d["cs"]), "DEINT_PRIMARIES": str(d["primaries"]),
+        "DEINT_TRC": str(d["trc"]),
+    }
+
+
 def _run_pipeline(settings: Settings, job) -> int:
     source = _allowed_source(settings, job["source_cache_path"])
     output = Path(job["output_path"]).resolve()
@@ -359,6 +454,7 @@ def _run_pipeline(settings: Settings, job) -> int:
         SEEDVR2_BATCH=str(snapshot["batch"]),
         SEEDVR2_CHUNK=str(snapshot["chunk"]),
         SEEDVR2_OVERLAP=str(snapshot["overlap"]),
+        **_deint_env(snapshot),
         FORCE="0",
     )
     global _ACTIVE_CONTAINER
@@ -522,9 +618,10 @@ def _validate_and_complete(settings: Settings, job) -> None:
             "SELECT frames_total FROM jobs WHERE id=?", (job["id"],)
         ).fetchone()
     expected_frames = expected_frames_row[0]
+    fps = _output_fps(json.loads(job["settings_json"]))
     expected_duration = (job["source_end_ms"] - job["source_start_ms"]) / 1000
-    if expected_frames < round(expected_duration * 50):
-        expected_duration = expected_frames / 50
+    if expected_frames < round(expected_duration * fps):
+        expected_duration = expected_frames / fps
     actual_duration = float(media.get("format", {}).get("duration", 0))
     streams = media.get("streams", [])
     video = next((item for item in streams if item.get("codec_type") == "video"), None)
@@ -567,7 +664,8 @@ def _validate_and_complete(settings: Settings, job) -> None:
         now = utc_now()
         db.execute(
             """UPDATE jobs SET state='completed', stage='complete', frames_done=frames_total,
-               fps=NULL, eta_seconds=0, error=NULL, completed_at=?, updated_at=? WHERE id=?""",
+               fps=NULL, eta_seconds=0, error=NULL, worker_pid=NULL, lease_expires_at=NULL,
+               auto_resume_count=0, completed_at=?, updated_at=? WHERE id=?""",
             (now, now, job["id"]),
         )
         append_event(
@@ -582,8 +680,8 @@ def _finish_error(settings: Settings, job_id: int, message: str, *, cancelled: b
     with connect(settings.database_path) as db, transaction(db):
         now = utc_now()
         db.execute(
-            """UPDATE jobs SET state=?, error=?, worker_pid=NULL, start_requested=0,
-               completed_at=?, updated_at=? WHERE id=?""",
+            """UPDATE jobs SET state=?, error=?, worker_pid=NULL, lease_expires_at=NULL,
+               start_requested=0, completed_at=?, updated_at=? WHERE id=?""",
             (state, None if cancelled else message, now, now, job_id),
         )
         append_event(db, job_id, "state", state=state, message=message)
@@ -601,20 +699,26 @@ def _probe_frame_count(settings: Settings, path: Path) -> int:
     return int(result.stdout.strip() or 0)
 
 
-def _plan_units(frames_total: int, chunk: int, overlap: int) -> list[dict[str, int]]:
+def _plan_units(frames_total: int, chunk: int, overlap: int, ms_per_frame: float = 20.0) -> list[dict[str, int]]:
     """Split a job's output frames into durable units. Unit 0 uses a reversed
     warm-up (prepend); later units carry `overlap` raw context frames that are
-    dropped from the output so each unit holds exactly its new frames."""
+    dropped from the output so each unit holds exactly its new frames.
+    ms_per_frame (1000/fps) sets each unit's source-ms bounds — 20 ms at 50p,
+    ~16.68 ms at 59.94p."""
     units: list[dict[str, int]] = []
     seq = 0
     start = 0
     while start < frames_total:
         new = min(chunk, frames_total - start)
+        start_ms = round(start * ms_per_frame)
+        end_ms = round((start + new) * ms_per_frame)
         if seq == 0:
-            units.append(dict(seq=0, start=0, new=new, skip=0, cap=new, prepend=overlap, drop=0, ctx=0))
+            units.append(dict(seq=0, start=0, new=new, skip=0, cap=new, prepend=overlap, drop=0, ctx=0,
+                              start_ms=start_ms, end_ms=end_ms))
         else:
             units.append(dict(seq=seq, start=start, new=new, skip=start - overlap,
-                              cap=new + overlap, prepend=0, drop=overlap, ctx=overlap))
+                              cap=new + overlap, prepend=0, drop=overlap, ctx=overlap,
+                              start_ms=start_ms, end_ms=end_ms))
         start += new
         seq += 1
     return units
@@ -634,7 +738,7 @@ def _record_chunk(settings, job_id, unit, unit_path: Path, state: str, frame_cou
                    ON CONFLICT(job_id, sequence) DO UPDATE SET state=excluded.state,
                      frame_count=excluded.frame_count, artifact_path=excluded.artifact_path,
                      updated_at=excluded.updated_at""",
-                (job_id, unit["seq"], round(unit["start"] * 20), round((unit["start"] + unit["new"]) * 20),
+                (job_id, unit["seq"], unit["start_ms"], unit["end_ms"],
                  unit["ctx"], unit["prepend"], state, frame_count, relative, now, now),
             )
     retry_db(op, attempts=5, base_delay=0.3)
@@ -686,7 +790,7 @@ def _yield_job(settings: Settings, job_id: int, reason: str) -> None:
     def op() -> None:
         with connect(settings.database_path) as db, transaction(db):
             db.execute(
-                "UPDATE jobs SET state='queued', start_requested=1, worker_pid=NULL, updated_at=? WHERE id=?",
+                "UPDATE jobs SET state='queued', start_requested=1, worker_pid=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?",
                 (utc_now(), job_id),
             )
             append_event(db, job_id, "state", state="queued", message=f"Yielded GPU between units ({reason}); will resume when idle")
@@ -712,7 +816,7 @@ def _pause_job(settings: Settings, job_id: int) -> None:
         with connect(settings.database_path) as db, transaction(db):
             now = utc_now()
             db.execute(
-                "UPDATE jobs SET state='paused', worker_pid=NULL, start_requested=0, updated_at=? WHERE id=?",
+                "UPDATE jobs SET state='paused', worker_pid=NULL, lease_expires_at=NULL, start_requested=0, updated_at=? WHERE id=?",
                 (now, job_id),
             )
             append_event(db, job_id, "state", state="paused", message="Paused after completing the current unit; resume to continue")
@@ -816,7 +920,7 @@ def _run_unit(settings, job, source, start_sec, duration, unit, unit_path: Path,
         PIPELINE_FREE_SPACE_RESERVE_BYTES=str(settings.free_space_reserve_bytes),
         SEEDVR2_MODEL=str(snapshot["model"]), SEEDVR2_RESOLUTION=str(snapshot["resolution"]),
         SEEDVR2_BATCH=str(snapshot["batch"]), SEEDVR2_CHUNK=str(snapshot["chunk"]),
-        SEEDVR2_OVERLAP=str(snapshot["overlap"]), FORCE="0",
+        SEEDVR2_OVERLAP=str(snapshot["overlap"]), **_deint_env(snapshot), FORCE="0",
         UNIT_OUTPUT=str(unit_path), UNIT_SKIP=str(unit["skip"]), UNIT_LOAD_CAP=str(unit["cap"]),
         UNIT_PREPEND=str(unit["prepend"]), UNIT_DROP=str(unit["drop"]),
     )
@@ -850,7 +954,7 @@ def _run_units(settings: Settings, job) -> int:
     snapshot = json.loads(job["settings_json"])
     chunk = int(snapshot["chunk"])
     overlap = int(snapshot["overlap"])
-    units = _plan_units(job["frames_total"], chunk, overlap)
+    units = _plan_units(job["frames_total"], chunk, overlap, 1000.0 / _output_fps(snapshot))
     work = settings.data_dir / "restoration_work" / job["public_id"]
     units_dir = work / "units"
     units_dir.mkdir(parents=True, exist_ok=True)
@@ -960,29 +1064,58 @@ def _cloud_enabled() -> bool:
 
 
 def _reconcile_cloud_pods(settings: Settings) -> None:
-    """On worker startup terminate every pod this project owns, and mark the
-    ledger terminated. A cloud job never survives a worker restart (its in-memory
-    thread pool is gone), so any live pod is an orphan billing money — kill it.
-    The job itself is requeued by _recover_interrupted and resumes from its valid
-    units on fresh pods. This is the money-safety analogue of interrupted-job
-    recovery."""
+    """On cloud-worker startup terminate every pod this project owns, then
+    reconcile the ledger against RunPod's TRUTH — never against optimism.
+
+    A cloud job never survives a worker restart (its in-memory thread pool is
+    gone), so any live pod is an orphan billing money — kill it. The job itself
+    is requeued by _recover_interrupted and resumes from its valid units on fresh
+    pods.
+
+    Crucially, a ledger row is finalised ('terminated', terminated_at set —
+    which is what stops spend counting it) ONLY when the provider confirms the
+    pod is gone: either the delete succeeded, or the pod is absent from the live
+    list entirely. A pod we FAILED to confirm dead stays 'terminating' with
+    terminated_at NULL, so spend keeps counting it and the reaper finishes the
+    job. The old code marked every row terminated unconditionally, which could
+    hide a pod that was still billing."""
     try:
         from webapp.cloud.runpod_api import RunpodClient, RunpodError
         client = RunpodClient()
-        killed = 0
-        for pod in client.our_pods():
+        live_before = {p["id"]: p for p in client.our_pods()}
+        confirmed_gone: set[str] = set()
+        still_live: set[str] = set()
+        for pod_id in live_before:
             try:
-                client.terminate_pod(pod["id"])
-                killed += 1
+                client.terminate_pod(pod_id)  # True or raises
+                confirmed_gone.add(pod_id)
             except RunpodError as exc:
-                print(f"reconcile: failed to terminate orphan pod {pod.get('id')}: {exc}", flush=True)
-        if killed:
-            print(f"reconcile: terminated {killed} orphaned cloud pod(s) from a previous run", flush=True)
+                still_live.add(pod_id)
+                print(f"reconcile: UNCONFIRMED terminate of orphan pod {pod_id}: {exc} "
+                      f"(may still be billing; reaper will retry)", flush=True)
+        if confirmed_gone:
+            print(f"reconcile: terminated {len(confirmed_gone)} orphaned cloud pod(s)", flush=True)
+        now = utc_now()
         with connect(settings.database_path) as db, transaction(db):
-            db.execute(
-                "UPDATE cloud_pods SET state='terminated', terminated_at=? WHERE state != 'terminated'",
-                (utc_now(),),
-            )
+            rows = db.execute(
+                "SELECT id, pod_id FROM cloud_pods WHERE terminated_at IS NULL"
+            ).fetchall()
+            for row in rows:
+                pid = row["pod_id"]
+                if pid is None or pid in confirmed_gone or pid not in live_before:
+                    # No pod id, just killed, or provider never listed it -> gone.
+                    db.execute(
+                        "UPDATE cloud_pods SET state='terminated', terminated_at=? WHERE id=?",
+                        (now, row["id"]),
+                    )
+                else:
+                    # Still live and we could not confirm the kill: keep counting
+                    # its spend and leave it for the reaper to finish off.
+                    db.execute(
+                        "UPDATE cloud_pods SET state='terminating', "
+                        "error=COALESCE(error,'orphan terminate unconfirmed at startup') WHERE id=?",
+                        (row["id"],),
+                    )
     except Exception as exc:  # never block startup on cloud reconciliation
         print(f"reconcile: cloud pod reconciliation skipped: {exc}", flush=True)
 
@@ -991,10 +1124,12 @@ def _run_prepare(settings: Settings, job, source, start_sec: float, duration: fl
     """Run stage-1 deinterlace locally (PREPARE_ONLY) so the FFV1 intermediate
     exists to slice. Reuses pipeline_v3.sh so the exact pinned deinterlace command
     is shared with the local path."""
+    snapshot = json.loads(job["settings_json"])
     env = os.environ.copy()
     env.update(
         PIPELINE_WORK_ROOT=str(settings.data_dir / "restoration_work"),
         PIPELINE_FREE_SPACE_RESERVE_BYTES=str(settings.free_space_reserve_bytes),
+        **_deint_env(snapshot),
         PREPARE_ONLY="1", FORCE="0",
     )
     command = [str(settings.pipeline_path), str(source), f"{start_sec:.3f}", f"{duration:.3f}",
@@ -1067,7 +1202,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
     snapshot = json.loads(job["settings_json"])
     chunk, overlap = int(snapshot["chunk"]), int(snapshot["overlap"])
     model, resolution, batch = str(snapshot["model"]), int(snapshot["resolution"]), int(snapshot["batch"])
-    units = _plan_units(job["frames_total"], chunk, overlap)
+    units = _plan_units(job["frames_total"], chunk, overlap, 1000.0 / _output_fps(snapshot))
     work = settings.data_dir / "restoration_work" / job["public_id"]
     units_dir = work / "units"
     slices_dir = work / "slices"
@@ -1095,6 +1230,15 @@ def _run_units_cloud(settings: Settings, job) -> int:
         if state == "pause_requested":
             return "pause"
         return None
+
+    def hard_stop() -> str | None:
+        """A reason to ABORT an in-flight remote unit right now. Cancel and
+        shutdown qualify; a PAUSE does NOT — pause stops dispatching NEW units
+        but lets the units already running on pods finish and commit, so a pause
+        never throws away up to `n_slots` nearly-done PAID units. (stop_reason()
+        still returns 'pause' so the loop stops handing out fresh slots.)"""
+        reason = stop_reason()
+        return reason if reason in ("cancel", "shutdown") else None
 
     # Resume: skip units already valid on disk.
     pending = []
@@ -1151,6 +1295,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 if stop_reason():
                     return
                 slice_unit(stage1, unit["skip"], unit["cap"], spath,
+                           fps=_output_fps(snapshot),
                            ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir,
                            allow_short=(unit["seq"] == len(units) - 1))
                 _record_chunk(settings, job["id"], unit, upath, "running")
@@ -1159,7 +1304,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 res = run_unit_remote(
                     slot.endpoint, cfg.ssh_key, slice_path=spath, local_out=upath, unit=unit,
                     model=model, resolution=resolution, batch=batch, overlap=overlap,
-                    log_path=log, should_abort=lambda: stop_reason() is not None,
+                    log_path=log, should_abort=lambda: hard_stop() is not None,
                 )
                 spath.unlink(missing_ok=True)
                 if res.status == -1:  # aborted (stop requested)
@@ -1194,7 +1339,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
                         with dispatch_lock:
                             more_work = to_dispatch[0] > 0
                         if more_work:
-                            fleet.slot_queue.put(slot)
+                            fleet.hand_back(slot)  # refreshes the pod's TTL clock
                         else:
                             fleet.retire_slot(slot)
 
@@ -1218,6 +1363,15 @@ def _run_units_cloud(settings: Settings, job) -> int:
             return 75
         if reason == "pause":
             return STATUS_PAUSED
+        if fleet.capped:
+            # The spend cap tore the fleet down mid-run. Valid units are durably
+            # saved, so this fails cleanly and resumes on those units once the
+            # operator raises the cap — it is NOT an error to hide.
+            done = _units_frames_done(settings, job["id"]) or 0
+            raise WorkerError(
+                f"cloud spend cap ${cfg.spend_cap_usd:.0f} reached; fleet torn down with "
+                f"{done}/{job['frames_total']} frames done. Raise WEDDING_CLOUD_SPEND_CAP_USD "
+                f"and resume to continue from the finished units.")
         if errors:
             raise WorkerError(f"{len(errors)} unit(s) failed: {errors[0]}")
 
@@ -1319,7 +1473,14 @@ def main(argv: list[str] | None = None) -> None:
         else None
     )
     gate_poll_seconds = 2.0
-    with GpuLock(settings.data_dir / "worker" / "gpu.lock"):
+    # Scope the exclusive lock to what the worker actually contends for. A local
+    # worker owns the physical GPU (gpu.lock); a cloud worker uses the local CPU
+    # only (deinterlace/slice) and ships units to rented pods, so it takes a
+    # separate cloud-worker.lock. That lets a local and a cloud worker run side by
+    # side against the same queue — job claiming is already atomic (_claim_next),
+    # so they never grab the same segment.
+    lock_name = "cloud-worker.lock" if _cloud_enabled() else "gpu.lock"
+    with GpuLock(settings.data_dir / "worker" / lock_name):
         _heartbeat(settings, "idle", started=True)
         try:
             retry_db(lambda: _recover_interrupted(settings), attempts=5, base_delay=0.5)
@@ -1329,37 +1490,52 @@ def main(argv: list[str] | None = None) -> None:
         # Kill any cloud pods orphaned by a previous crash before claiming work.
         if _cloud_enabled():
             _reconcile_cloud_pods(settings)
+        # Renew this worker's job lease in the background so a peer worker never
+        # mistakes our running job for abandoned and requeues it under us.
+        renew_stop = threading.Event()
+        renewer = threading.Thread(target=_lease_renewer, args=(settings, renew_stop),
+                                   daemon=True, name="lease-renewer")
+        renewer.start()
         backoff = max(0.2, args.poll_seconds)
-        while not _SHUTDOWN:
-            # Idle gate: if work is waiting but the GPU is not idle enough, hold
-            # off claiming and report why, rather than starting and OOMing.
-            if idle_gate is not None and not args.once:
-                startable = _best_effort(lambda: _has_startable_job(settings))
-                if startable and not idle_gate.poll():
-                    _heartbeat(settings, "waiting", detail=idle_gate.last_reason)
-                    time.sleep(gate_poll_seconds)
+        last_sweep = 0.0
+        try:
+            while not _SHUTDOWN:
+                # Periodically reclaim a crashed PEER worker's job (stale lease).
+                # Our own job is lease-fresh, so this never touches it.
+                if time.monotonic() - last_sweep > LEASE_RENEW_S:
+                    _best_effort(lambda: _recover_interrupted(settings))
+                    last_sweep = time.monotonic()
+                # Idle gate: if work is waiting but the GPU is not idle enough, hold
+                # off claiming and report why, rather than starting and OOMing.
+                if idle_gate is not None and not args.once:
+                    startable = _best_effort(lambda: _has_startable_job(settings))
+                    if startable and not idle_gate.poll():
+                        _heartbeat(settings, "waiting", detail=idle_gate.last_reason)
+                        time.sleep(gate_poll_seconds)
+                        continue
+                try:
+                    job = retry_db(lambda: _claim_next(settings), attempts=5, base_delay=0.5, max_delay=10.0)
+                except TRANSIENT_DB_ERRORS as exc:
+                    _heartbeat(settings, "db_error", error=str(exc))
+                    print(f"Job claim failed after retries; backing off {backoff:.0f}s: {exc}", flush=True)
+                    time.sleep(min(30.0, backoff))
+                    backoff = min(30.0, backoff * 2)
                     continue
-            try:
-                job = retry_db(lambda: _claim_next(settings), attempts=5, base_delay=0.5, max_delay=10.0)
-            except TRANSIENT_DB_ERRORS as exc:
-                _heartbeat(settings, "db_error", error=str(exc))
-                print(f"Job claim failed after retries; backing off {backoff:.0f}s: {exc}", flush=True)
-                time.sleep(min(30.0, backoff))
-                backoff = min(30.0, backoff * 2)
-                continue
-            backoff = max(0.2, args.poll_seconds)
-            if job is not None:
-                print(f"Claimed {job['public_id']}: {job['display_name']}", flush=True)
-                _heartbeat(settings, "running", active_job_id=job["id"])
-                run_job(settings, job)
-                _heartbeat(settings, "idle")
-                if args.once:
+                backoff = max(0.2, args.poll_seconds)
+                if job is not None:
+                    print(f"Claimed {job['public_id']}: {job['display_name']}", flush=True)
+                    _heartbeat(settings, "running", active_job_id=job["id"])
+                    run_job(settings, job)
+                    _heartbeat(settings, "idle")
+                    if args.once:
+                        break
+                elif args.once:
+                    print("No started job is waiting", flush=True)
                     break
-            elif args.once:
-                print("No started job is waiting", flush=True)
-                break
-            else:
-                time.sleep(max(0.2, args.poll_seconds))
+                else:
+                    time.sleep(max(0.2, args.poll_seconds))
+        finally:
+            renew_stop.set()
         if _SHUTDOWN:
             _heartbeat(settings, "stopped")
 

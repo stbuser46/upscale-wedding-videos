@@ -1,0 +1,19 @@
+[Unit]
+Description=Wedding cloud pod reaper (money-safety backstop)
+Documentation=man:webapp.cloud.reaper
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/yacoob/Projects/upscale-wedding-videos
+# Age filter is the safety belt: this only terminates pods older than 4h, so it
+# can run on a timer WITHOUT killing a healthy in-progress fleet (units finish in
+# ~15-20 min; even a whole chapter's pod lives well under 4h). It exists to catch
+# TRUE orphans — pods a SIGKILLed / power-lost worker left billing — which no
+# other layer can reach once the worker process is gone. The API key is read
+# from webapp/data/runpod.env by the client (never placed on the command line).
+ExecStart=/home/yacoob/Projects/upscale-wedding-videos/webapp/.venv/bin/python -m webapp.cloud.reaper --yes --max-age-hours 4
+# A reap failure (e.g. RunPod unreachable) must not disable the timer; the next
+# tick retries. Success-exit only matters for logging.
+SuccessExitStatus=0 1

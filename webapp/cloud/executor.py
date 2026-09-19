@@ -119,12 +119,27 @@ def run_unit_remote(
             return UnitResult(status=proc.returncode or 1, upload_s=t_up, restore_s=t_run,
                               message=f"remote restore exited {proc.returncode}")
 
+        # The unit is ALREADY restored (paid for) on the pod. A transient network
+        # blip on the pull must not throw that work away and retire the pod — so
+        # retry a few times while the pod is still alive. rsync is --partial
+        # --inplace, so each retry resumes the same file rather than restarting.
         t2 = time.monotonic()
-        try:
-            rsync(endpoint, local_out, remote_out, upload=False, ssh_key=ssh_key, timeout=1800)
-        except Exception as exc:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            if should_abort():
+                return UnitResult(status=-1, upload_s=t_up, restore_s=t_run, message="aborted")
+            try:
+                rsync(endpoint, local_out, remote_out, upload=False, ssh_key=ssh_key, timeout=1800)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                log.write(f"=== unit {unit['seq']} download attempt {attempt + 1}/3 failed: {exc} ===\n")
+                log.flush()
+                time.sleep(3 * (attempt + 1))
+        if last_exc is not None:
             return UnitResult(status=1, upload_s=t_up, restore_s=t_run,
-                              message=f"download failed: {exc}")
+                              message=f"download failed after 3 attempts: {last_exc}")
         t_down = time.monotonic() - t2
 
         if not local_out.is_file() or local_out.stat().st_size == 0:

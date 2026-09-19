@@ -24,7 +24,7 @@ def slice_unit(
     cap: int,
     dest: Path,
     *,
-    fps: int = 50,
+    fps: float = 50.0,
     ffmpeg_image: str = "linuxserver/ffmpeg:latest",
     data_dir: Path | None = None,
     use_docker: bool = True,
@@ -51,6 +51,15 @@ def slice_unit(
     dest.parent.mkdir(parents=True, exist_ok=True)
     # keep the real extension so ffmpeg can pick a muxer: name.partial.mkv
     part = dest.parent / f"{dest.stem}.partial{dest.suffix}"
+    # `-ss` seeks by TIME, and stage-1 is intra-only FFV1, so the seek is
+    # frame-exact ONLY when `fps` matches the stage-1 output frame rate. The
+    # caller MUST pass the job's real output fps (50 for PAL, 60000/1001≈59.94
+    # for NTSC): frame `skip` sits at PTS skip/fps, and using the wrong fps
+    # lands on the wrong frame. For NTSC at the default 50 that error is ~19% of
+    # `skip` and grows every unit, yet frame-count validation still passes
+    # (interior slices still hold `cap` frames) — so the whole cloud run would
+    # silently restore shifted footage. The 6-decimal timestamp is well within
+    # half a frame of the true PTS, so it snaps to exactly frame `skip`.
     ss = f"{skip / fps:.6f}"
 
     if use_docker:
