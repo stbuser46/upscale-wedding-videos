@@ -191,11 +191,18 @@ pre-lease (old-code) worker writes no lease, restart the local worker onto this
 code *before* starting a cloud worker beside it, or the cloud worker's recovery
 will treat the local job as unleased.
 
+**Live-verified (2026-09-21, ~$0.91):** an interior unit (skip=746) of a real
+Gulfraz NTSC segment was restored on a rented RTX PRO 6000 from a corrected-fps
+slice → valid 1920×1440 10-bit HEVC BT.709 59.94 fps, and **51.97 dB avg / 49.88
+dB min PSNR against the local-restored same unit** (0/750 frames < 25 dB): same
+frames, not shifted (the old fps=50 bug would have shifted ~148 frames → ~10–15
+dB). The guaranteed-teardown wrapper left 0 pods; the reaper confirmed clean. The
+cloud path is now proven end-to-end for NTSC.
+
 **Not yet built:** no per-job or in-GUI choice of executor (it is a worker-wide
-env var), and no automatic local↔cloud placement or cost-based scheduling. The
-cloud path's money-safety and slicing fixes are unit-verified but **not yet
-re-verified end-to-end against real pods** — a cheap interior-unit (skip>0) NTSC
-run is the remaining live check before a full paid fan-out.
+env var), and no automatic local↔cloud placement or cost-based scheduling. A full
+multi-pod paid fan-out has been proven per-unit but not yet run end-to-end for a
+whole chapter.
 
 ## Not implemented
 
