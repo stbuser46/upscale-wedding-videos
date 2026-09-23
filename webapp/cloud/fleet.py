@@ -10,6 +10,8 @@ so a crash can never leave a billable pod the reaper can't find.
 
 from __future__ import annotations
 
+import random
+import shlex
 import subprocess
 import threading
 import time
@@ -26,6 +28,10 @@ from .runpod_api import (
 )
 
 PROVISION_SCRIPT = "provision_pod.sh"
+# One stage-1 intermediate per job lives on a single "seed" pod; slices are cut
+# there and passed pod-to-pod, so the multi-GB file crosses the home upstream
+# at most once (see stage_intermediate / slice_from_seed).
+REMOTE_INTERMEDIATE = "/workspace/intermediate.mkv"
 
 
 def _now_iso() -> str:
@@ -72,9 +78,26 @@ class CloudFleet:
         self._slots: dict[str, Slot] = {}          # pod_id -> Slot (live)
         self._lock = threading.Lock()
         self._cache_lock = threading.Lock()
+        # Warm-cache peer seeding: the tarball crosses the home upstream ONCE
+        # (serialized by _cache_home_busy); every later pod pulls it from an
+        # already-provisioned pod at datacenter speed. At 16 slots this turns
+        # ~3 GB of home upload (competing with unit-slice uploads) into 186 MB.
+        self._cache_cv = threading.Condition()
+        self._cache_seeds: list[tuple[str, int]] = []   # endpoints holding the tarball
+        self._cache_home_busy = False
+        self._jobkey: tuple[Path, str] | None = None    # (private key path, pubkey text)
+        # Stage-1 intermediate peer store: home ingress speed per pod (measured
+        # during provisioning), the pod currently holding the intermediate, and
+        # the lazily-started one-at-a-time staging upload.
+        self._ingress_hint: dict[tuple[str, int], float] = {}
+        self._inter_lock = threading.Lock()
+        self._inter_seed: tuple[str, int] | None = None
+        self._inter_thread: threading.Thread | None = None
+        self._inter_attempts = 0
         self._ready = 0
         self._requested = 0
         self._capped = False                       # spend cap tripped -> fleet torn down
+        self._no_more_work = threading.Event()     # dispatcher out of units
         self._monitor: threading.Thread | None = None
 
     # ---------------------------------------------------------------- ledger
@@ -199,6 +222,22 @@ class CloudFleet:
                 if self.provisioning_done() and no_live_slots:
                     return None  # every pod failed to come up; give up
 
+    def mark_no_more_work(self) -> None:
+        """The dispatcher has no units left to hand out: retire every pod
+        sitting unclaimed in the slot queue, retire any that goes READY later,
+        and abandon bring-ups still in flight. Without this, a slow pod that
+        becomes READY after the queue drained bills unowned until job end —
+        observed live 2026-09-23, where exactly that idle pod burned the
+        spend-cap margin while another pod restored the last unit."""
+        self._no_more_work.set()
+        while True:
+            try:
+                slot = self.slot_queue.get_nowait()
+            except Empty:
+                break
+            self.log(f"[fleet] retiring unclaimed pod {slot.pod_id} (no work remains)")
+            self.retire_slot(slot)
+
     def hand_back(self, slot: "Slot") -> None:
         """Return a healthy slot to the queue after it finished a unit, and
         refresh its TTL clock — completing a unit is proof the pod is alive, so
@@ -244,6 +283,11 @@ class CloudFleet:
         for attempt in range(self.cfg.bring_up_attempts):
             if self._stop.is_set():
                 return
+            if self._no_more_work.is_set():
+                self.log(f"[fleet] pod {index} bring-up abandoned (no work remains)")
+                self._ledger(name, state="terminated", error="abandoned: no work remains",
+                             terminated_at=_now_iso())
+                return
             if self.spend_so_far() >= self.cfg.spend_cap_usd:
                 self.log(f"[fleet] spend cap reached; stop bringing up pod {index}")
                 break
@@ -265,6 +309,12 @@ class CloudFleet:
                     self._terminate(pod_id, name)
                     return
                 self._provision_pod(endpoint, index)
+                if self._no_more_work.is_set():
+                    # Provisioned, but every unit is already handled: retire NOW
+                    # rather than queueing a pod nobody will ever claim.
+                    self.log(f"[fleet] pod {index} READY but no work remains; retiring")
+                    self._terminate(pod_id, name)
+                    return
                 slot = Slot(pod_id=pod_id, name=name, endpoint=endpoint, gpu_type=gpu_type,
                             hourly_rate=pod.get("costPerHr") or rate, created_at=time.monotonic())
                 with self._lock:
@@ -341,6 +391,207 @@ class CloudFleet:
                                check=True, capture_output=True)
         return tar
 
+    def _ensure_jobkey(self) -> tuple[Path, str]:
+        """One ephemeral ed25519 keypair per fleet run, used ONLY for pod-to-pod
+        cache seeding. Job-scoped and short-lived: pods within one job already
+        fully trust each other (same media, same code), and the key dies with
+        the pods at teardown. It is NOT the operator key in cloud/keys/."""
+        with self._cache_lock:
+            if self._jobkey is None:
+                priv = self.cfg.provision_dir / "_jobkey"
+                pub = Path(f"{priv}.pub")
+                priv.unlink(missing_ok=True)
+                pub.unlink(missing_ok=True)
+                subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", str(priv),
+                     "-C", f"wedding-job-{self.job['public_id']}"],
+                    check=True, capture_output=True)
+                self._jobkey = (priv, pub.read_text().strip())
+        return self._jobkey
+
+    def _enable_peer_access(self, endpoint) -> None:
+        """Let this pod copy files to/from its job peers (cache tarball, unit
+        slices) with the ephemeral job key."""
+        priv, pub = self._ensure_jobkey()
+        rsync(endpoint, priv, "/opt/jobkey", upload=True, ssh_key=self.cfg.ssh_key, timeout=60)
+        run_ssh(endpoint,
+                ["bash", "-c",
+                 f"chmod 600 /opt/jobkey && mkdir -p /root/.ssh && "
+                 f"echo {shlex.quote(pub)} >> /root/.ssh/authorized_keys"],
+                ssh_key=self.cfg.ssh_key, timeout=30)
+
+    def _ensure_cache_on_pod(self, endpoint, index: int, step) -> None:
+        """Get the warm-cache tarball onto a pod, preferring a peer that already
+        has it (datacenter-to-datacenter) over the home upstream. The home link
+        is used by at most one pod at a time and, in the common case, exactly
+        once per fleet; any peer failure falls back to the home upload, so this
+        can never do worse than the old per-pod upload."""
+        tarball = self._cache_tarball()
+        if tarball is None:
+            return
+        seed: tuple[str, int] | None = None
+        hold_home = False
+        deadline = time.monotonic() + 600
+        with self._cache_cv:
+            while seed is None and not hold_home:
+                if self._stop.is_set():
+                    raise RunpodError("fleet stopping")
+                if self._cache_seeds:
+                    seed = random.choice(self._cache_seeds)
+                elif not self._cache_home_busy:
+                    self._cache_home_busy = True
+                    hold_home = True
+                elif time.monotonic() > deadline:
+                    break  # never hang bring-up: fall through to a home upload
+                else:
+                    self._cache_cv.wait(timeout=5.0)
+        fetched = False
+        try:
+            if seed is not None:
+                try:
+                    step(f"fetched warm cache from peer pod {seed[0]}",
+                         lambda: run_ssh(endpoint, [
+                             "scp", "-P", str(seed[1]), "-i", "/opt/jobkey",
+                             "-o", "StrictHostKeyChecking=no",
+                             "-o", "UserKnownHostsFile=/dev/null",
+                             f"root@{seed[0]}:/opt/inductor_cache.tar",
+                             "/opt/inductor_cache.tar",
+                         ], ssh_key=self.cfg.ssh_key, timeout=300))
+                    fetched = True
+                except Exception as exc:
+                    self.log(f"[fleet] pod {index} peer cache fetch failed "
+                             f"({str(exc)[:80]}); falling back to home upload")
+            if not fetched:
+                t_home = time.monotonic()
+                step("uploaded warm cache tarball",
+                     lambda: rsync(endpoint, tarball, "/opt/inductor_cache.tar",
+                                   upload=True, ssh_key=self.cfg.ssh_key, timeout=600))
+                # Measured home->pod throughput doubles as the ingress hint for
+                # choosing which pod should hold the stage-1 intermediate.
+                self._ingress_hint[endpoint] = time.monotonic() - t_home
+        finally:
+            with self._cache_cv:
+                if hold_home:
+                    self._cache_home_busy = False
+                self._cache_cv.notify_all()
+        step("unpacked warm cache",
+             lambda: run_ssh(endpoint, ["tar", "-xf", "/opt/inductor_cache.tar",
+                                        "-C", "/opt/inductor_cache"], ssh_key=self.cfg.ssh_key))
+        with self._cache_cv:
+            self._cache_seeds.append(endpoint)
+            self._cache_cv.notify_all()
+
+    # ------------------------------------------- stage-1 intermediate peer store
+
+    def _live_endpoints(self) -> list[tuple[str, int]]:
+        with self._lock:
+            return [s.endpoint for s in self._slots.values()]
+
+    def start_intermediate_staging(self, local_path: Path) -> None:
+        """Begin uploading the stage-1 intermediate ONCE to the live pod with the
+        best measured home ingress, in the background. Idempotent; restaged
+        automatically (bounded) if the seed pod later dies. Until a seed exists
+        the dispatcher simply falls back to per-unit home uploads, so this can
+        never make a run slower than the old path."""
+        with self._inter_lock:
+            if self._inter_seed is not None or self._inter_attempts >= 3:
+                return
+            if self._inter_thread is not None and self._inter_thread.is_alive():
+                return
+            self._inter_thread = threading.Thread(
+                target=self._stage_intermediate, args=(Path(local_path),),
+                daemon=True, name="fleet-intermediate")
+            self._inter_thread.start()
+
+    def _stage_intermediate(self, local_path: Path) -> None:
+        live = self._live_endpoints()
+        if not live or self._stop.is_set():
+            # No pod is up yet (e.g. staging requested at dispatch start while
+            # the fleet is still provisioning): not an attempt — the next
+            # intermediate_seed() call relaunches this thread.
+            return
+        with self._inter_lock:
+            self._inter_attempts += 1
+        # Prefer the pod that took the cache tarball fastest from home.
+        live.sort(key=lambda e: (self._ingress_hint.get(e) is None,
+                                 self._ingress_hint.get(e, 0.0)))
+        target = live[0]
+        size_gb = local_path.stat().st_size / 1e9 if local_path.is_file() else 0.0
+        self.log(f"[fleet] staging stage-1 intermediate ({size_gb:.1f} GB) on {target[0]} "
+                 f"(one-time upload; slices will be cut there and passed pod-to-pod)")
+        t0 = time.monotonic()
+        try:
+            rsync(target, local_path, REMOTE_INTERMEDIATE, upload=True,
+                  ssh_key=self.cfg.ssh_key, timeout=3600)
+        except Exception as exc:
+            self.log(f"[fleet] WARN intermediate staging failed ({str(exc)[:100]}); "
+                     f"units continue via home uploads")
+            return
+        with self._inter_lock:
+            self._inter_seed = target
+        self.log(f"[fleet] intermediate staged on {target[0]} ({time.monotonic() - t0:.0f}s)")
+
+    def intermediate_seed(self, local_path: Path) -> tuple[str, int] | None:
+        """The endpoint currently holding the intermediate, or None. Lazily
+        (re)starts staging when there is no seed — covering both a seed pod
+        that died and a staging request that fired before any pod was live."""
+        with self._inter_lock:
+            seed = self._inter_seed
+        if seed is None:
+            self.start_intermediate_staging(local_path)
+            return None
+        if seed not in self._live_endpoints():
+            with self._inter_lock:
+                if self._inter_seed == seed:
+                    self._inter_seed = None
+            self.log(f"[fleet] intermediate seed {seed[0]} is gone; will restage")
+            self.start_intermediate_staging(local_path)
+            return None
+        return seed
+
+    def slice_from_seed(self, target: tuple[str, int], *, ss: str, cap: int,
+                        name: str, expected_hash: str) -> bool:
+        """Cut one unit's slice on the seed pod (stream copy — the exact command
+        the local slicer uses) and deliver it to `target` datacenter-side, then
+        PROVE it is decoded-identical to the locally-cut slice by comparing a
+        sha256 over its per-frame framemd5 hashes against `expected_hash`. Any
+        failure (including a hash mismatch from e.g. a seek-behaviour difference
+        in the pod's ffmpeg) returns False and the caller falls back to the home
+        upload — the peer path can silently ship only PROVEN-identical bytes."""
+        with self._inter_lock:
+            seed = self._inter_seed
+        if seed is None:
+            return False
+        remote_slice = f"/workspace/slices/{name}"
+        try:
+            run_ssh(seed, ["bash", "-c",
+                           f"ffmpeg -v error -y -ss {shlex.quote(ss)} -i {REMOTE_INTERMEDIATE} "
+                           f"-map 0:v:0 -frames:v {cap} -c copy {remote_slice}"],
+                    ssh_key=self.cfg.ssh_key, timeout=300)
+            if target != seed:
+                run_ssh(target, ["scp", "-P", str(seed[1]), "-i", "/opt/jobkey",
+                                 "-o", "StrictHostKeyChecking=no",
+                                 "-o", "UserKnownHostsFile=/dev/null",
+                                 f"root@{seed[0]}:{remote_slice}", remote_slice],
+                        ssh_key=self.cfg.ssh_key, timeout=300)
+                run_ssh(seed, ["rm", "-f", remote_slice], ssh_key=self.cfg.ssh_key, timeout=60)
+            probe = run_ssh(target, ["bash", "-c",
+                                     f"ffmpeg -v error -i {remote_slice} -f framemd5 - "
+                                     f"| grep -v '^#' | awk '{{print $NF}}' | sha256sum"],
+                            ssh_key=self.cfg.ssh_key, timeout=300)
+            got = probe.stdout.split()[0] if probe.stdout else ""
+            if got != expected_hash:
+                self.log(f"[fleet] peer slice {name} hash mismatch on {target[0]} "
+                         f"(pod ffmpeg differs?); falling back to home upload")
+                run_ssh(target, ["rm", "-f", remote_slice], ssh_key=self.cfg.ssh_key,
+                        timeout=60, check=False)
+                return False
+            return True
+        except Exception as exc:
+            self.log(f"[fleet] peer slice {name} failed ({str(exc)[:80]}); "
+                     f"falling back to home upload")
+            return False
+
     def _provision_pod(self, endpoint, index: int) -> None:
         cfg = self.cfg
         pdir = cfg.provision_dir
@@ -365,14 +616,8 @@ class CloudFleet:
         for f in ("requirements-pod.txt", "provision_pod.sh"):
             rsync(endpoint, pdir / f, f"/workspace/provision/{f}", upload=True, ssh_key=cfg.ssh_key)
 
-        tarball = self._cache_tarball()
-        if tarball is not None:
-            step("uploaded warm cache tarball",
-                 lambda: rsync(endpoint, tarball, "/opt/inductor_cache.tar",
-                               upload=True, ssh_key=cfg.ssh_key, timeout=600))
-            step("unpacked warm cache",
-                 lambda: run_ssh(endpoint, ["tar", "-xf", "/opt/inductor_cache.tar",
-                                            "-C", "/opt/inductor_cache"], ssh_key=cfg.ssh_key))
+        self._enable_peer_access(endpoint)
+        self._ensure_cache_on_pod(endpoint, index, step)
 
         # Stream provisioning (apt/pip/7.3 GB weights) to a per-pod log rather
         # than buffering it, and enforce a hard timeout so a stuck pod fails

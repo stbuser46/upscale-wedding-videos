@@ -234,7 +234,17 @@ dl dd { margin: 5px 0 0; overflow-wrap: anywhere; }
 .cloud-stat strong { font: 500 15px Georgia, serif; font-variant-numeric: tabular-nums; }
 .cloud-stat span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
 .cloud-error { margin: 0; color: #8c342e; font-size: 12px; line-height: 1.4; background: #f5e4e1; border-radius: 8px; padding: 8px 10px; }
+.cloud-hint { margin: 0; color: #8a6d3b; font-size: 11px; line-height: 1.4; background: #f3ead8; border-radius: 8px; padding: 6px 9px; }
 .cloud-local-note { font-size: 13px; margin: 6px 0 0; }
+.cloud-job-panel { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); }
+.cloud-job-line { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+.cloud-job-spend { font-weight: 700; font-variant-numeric: tabular-nums; }
+.cloud-units { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.unit-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 26px; padding: 0 6px; border-radius: 8px; background: #ece6de; color: var(--muted); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.unit-chip.valid { background: #dfeadd; color: #456044; }
+.unit-chip.running { background: #e3ebe3; color: #526452; box-shadow: 0 0 0 2px rgba(82,100,82,.18); }
+.unit-chip.invalid { background: #f1dddd; color: #8c342e; }
+.unit-chip.pending { background: #ece6de; color: var(--muted); opacity: .6; }
 
 /* Restoration previews (previews page) */
 .preview-set { margin-top: 40px; }

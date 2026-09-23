@@ -296,12 +296,26 @@ function cloudPodCard(pod) {
   const shortId = (pod.pod_id || pod.name || "pod").slice(0, 12);
   head.append(el("span", "cloud-pod-id", shortId), el("span", `cloud-state ${pod.state}`, pod.state.replaceAll("_", " ")));
   const job = pod.job_public_id ? `job ${pod.job_public_id}` : "unassigned";
-  const unit = pod.unit === null || pod.unit === undefined ? "—" : `#${pod.unit}`;
   const meta = el("div", "cloud-meta");
-  meta.append(cloudStat("Unit", unit), cloudStat("Uptime", formatUptime(pod.uptime_s)), cloudStat("Cost", `$${pod.cost_usd.toFixed(2)}`));
+  meta.append(
+    cloudStat("Rate", `$${(pod.rate_per_hr ?? 0).toFixed(2)}/h`),
+    cloudStat("Uptime", formatUptime(pod.uptime_s)),
+    cloudStat("Accrued", `$${pod.cost_usd.toFixed(2)}`),
+  );
   card.append(head, el("div", "cloud-gpu", pod.gpu || "GPU"), el("div", "cloud-job muted", job), meta);
+  if (pod.provisioning_hint) card.append(el("p", "cloud-hint", pod.provisioning_hint));
   if (pod.error) card.append(el("p", "cloud-error", pod.error));
   return card;
+}
+
+// One small chip per restoration unit — a live "unit 3/5" strip for the
+// active cloud job. State colours mirror the queue's own .state-pill palette
+// (valid=completed green, running=in-progress green, invalid=failed red).
+function unitChip(unit) {
+  const chip = el("span", `unit-chip ${unit.state}`, String(unit.sequence + 1));
+  const frames = unit.frame_count ? `, ${unit.frame_count} frames` : "";
+  chip.title = `Unit ${unit.sequence + 1}: ${unit.state}${frames}`;
+  return chip;
 }
 
 function renderCloudFleet(fleet) {
@@ -314,6 +328,23 @@ function renderCloudFleet(fleet) {
   }
   const grid = document.getElementById("cloud-pods");
   if (grid) grid.replaceChildren(...(fleet.pods.length ? fleet.pods.map(cloudPodCard) : [el("div", "empty-state", "No pods reported yet.")]));
+
+  const jobPanel = document.getElementById("cloud-job");
+  const job = fleet.active_job;
+  if (jobPanel) jobPanel.classList.toggle("hidden", !job);
+  if (job) {
+    const title = document.getElementById("cloud-job-title");
+    if (title) {
+      const c = job.units_summary || {};
+      const doneOf = job.units_total ? ` · unit ${(c.valid || 0) + (c.running || 0)}/${job.units_total}` : "";
+      const detail = job.worker_detail ? ` — ${job.worker_detail}` : "";
+      title.textContent = `Job ${job.public_id}${doneOf}${detail}`;
+    }
+    const spend = document.getElementById("cloud-job-spend");
+    if (spend) spend.textContent = `$${job.spend_usd.toFixed(2)} this job`;
+    const units = document.getElementById("cloud-units");
+    if (units) units.replaceChildren(...(job.units.length ? job.units.map(unitChip) : [el("span", "muted", "No units recorded yet.")]));
+  }
 }
 
 let cloudLoading = false;

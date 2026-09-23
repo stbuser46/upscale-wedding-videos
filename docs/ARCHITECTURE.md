@@ -132,13 +132,57 @@ worker-wide — there is no per-job cloud toggle in the API or GUI.
   billing, and enforces `WEDDING_CLOUD_SPEND_CAP_USD` (default 250). It is a
   context manager whose `terminate_all()` also sweeps RunPod for any stray pod
   carrying this job's name prefix, so teardown never depends on a clean exit.
-- `webapp/cloud/executor.py` restores one unit on a pod (upload slice → run the
-  shared `seedvr2_unit_argv` → download result), with abort polling and a hard
-  per-unit timeout; a pod that fails or times out a unit is retired, not reused.
+- `webapp/cloud/executor.py` restores one unit on a pod with abort polling and a
+  hard per-unit timeout. Its three phases — `upload_unit_slice`, `restore_unit`,
+  `download_unit` (all running the shared `seedvr2_unit_argv`) — are exposed
+  separately so the dispatcher can pipeline them per pod; `run_unit_remote`
+  composes them sequentially for single-pod/CLI use.
 - `webapp/worker/runner.py` gains `_run_units_cloud`, pod reconciliation on
   startup (`_reconcile_cloud_pods`, terminating pods orphaned by a prior graceful
   restart), and the executor switch. The local durable-unit and whole-pipeline
   paths are untouched.
+
+**Pipelined dispatch (2026-09-23).** `_run_units_cloud` keeps rented GPUs busy
+instead of billing them through transfers:
+
+- **Provision-first:** the fleet starts provisioning before the local stage-1
+  deinterlace runs (pods take minutes to come up; the ~2-min prepare is hidden
+  inside that window). A prepare failure still tears the fleet down.
+- **Background pre-slicer:** one thread cuts slices in unit order a bounded
+  distance ahead of the pods (~2×slots × ~220 MB on disk), so no pod ever waits
+  on a local ffmpeg slice.
+- **Warm-cache peer seeding:** the ~186 MB Inductor-cache tarball crosses the
+  home upstream at most once per fleet (serialized); every later pod pulls it
+  pod-to-pod at datacenter speed using an ephemeral job-scoped ed25519 key
+  (`_ensure_cache_on_pod`, tested by `webapp/cloud/test_fleet_cache.py`). Any
+  peer failure falls back to the old per-pod home upload. Observed motivation:
+  during the 2026-09-23 live test the cache upload to pod 0 shared the home
+  link with two unit-slice uploads and crawled; at 16 slots it would be ~3 GB.
+- **Per-pod pipeline:** each pod is owned by one runner thread that uploads unit
+  N+1 while N restores, and downloads/validates N in a helper thread while N+1
+  restores — the paid GPU never idles on the home link. TTL refresh moves from
+  `hand_back()` to per-completed-unit (pipelined pods never re-enter the slot
+  queue); a heartbeat thread beats every 20 s during multi-minute restores.
+- **Intermediate peer store (the "middle path"):** the multi-GB stage-1 FFV1
+  crosses the home upstream at most ONCE per job — it is staged in the
+  background onto the live pod with the best measured home ingress, unit slices
+  are cut there with the exact local stream-copy command, delivered pod-to-pod
+  with the job key, and each remote slice must match the locally-cut slice's
+  framemd5 sha256 (`slice_frame_hash`) before a pod may restore it — a
+  decoded-identity proof, cross-build-verified. Any failure or mismatch falls
+  back to the per-unit home upload, so the peer path can only ever ship
+  proven-identical bytes and can never be slower than the old design.
+- **No unowned billing:** when the unit queue drains, runners call
+  `fleet.mark_no_more_work()` — unclaimed pods in the slot queue are retired
+  immediately, a pod that goes READY later is retired on arrival, and pending
+  bring-ups are abandoned. Found live 2026-09-23: a slow-provisioning pod went
+  READY after the queue emptied and billed idle until the spend cap tripped.
+- **In-run retry:** a unit that fails on a pod is requeued for another pod
+  (bounded at 2 total attempts) and the suspect pod is retired, instead of
+  failing the whole run and re-provisioning a fresh fleet via auto-resume.
+  Pause/cancel/cap semantics are unchanged and covered, with the rest of the
+  dispatch logic, by the no-network mock suite
+  `webapp/worker/test_cloud_dispatch.py`.
 - `webapp/server/cloud_views.py` adds a read-only `/api/cloud` fleet-status
   endpoint (live pods, uptime, derived spend), rendered as a "Cloud fleet" panel
   on the queue page. It degrades to `{"enabled": false}` on a database without

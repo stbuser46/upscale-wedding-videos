@@ -194,20 +194,42 @@ RunPod API key in `webapp/data/runpod.env` and an SSH key under `cloud/keys/`
 > power loss) can leave up to `WEDDING_CLOUD_MAX_SLOTS` pods billing until you
 > run the reaper by hand. Before setting `WEDDING_EXECUTOR=cloud`, set a RunPod
 > **account spend limit** and/or schedule `python -m webapp.cloud.reaper --yes`
-> on a timer. The cloud path is also not yet live-verified end to end.
+> on a timer, and keep `WEDDING_CLOUD_SPEND_CAP_USD` below your actual RunPod
+> balance. The cloud path was live-verified end to end on a real pod on
+> 2026-09-21 (frame-identical to the local restore, clean teardown); a full
+> multi-pod chapter fan-out has not yet been run.
 
 ### Worker fleet mode (opt-in)
 
 Start the worker with `WEDDING_EXECUTOR=cloud` and it dispatches a chapter's
 durable units across a concurrent pod fleet instead of the local card. This is a
 **worker-wide, per-process** choice — there is no per-job toggle in the GUI, and
-with the default (`local`) the cloud code never runs. Tuning:
+with the default (`local`) the cloud code never runs.
+
+Dispatch is **pipelined per pod**: the fleet provisions while the local stage-1
+deinterlace runs, a background thread pre-cuts slices ahead of the pods, each
+pod uploads the next unit's slice while restoring the current one and downloads
+finished units while the next restores, and a unit that fails on a pod is
+retried once on another pod (the suspect pod is retired). The paid GPUs
+therefore spend their time restoring, not waiting on the home link.
+
+A cloud worker runs happily **alongside** the local worker as a second process
+(it skips the GPU idle gate automatically and claims other queued jobs — never
+one a live worker holds a lease on). Typical launch:
+
+```bash
+cd webapp && WEDDING_EXECUTOR=cloud WEDDING_DURABLE_UNITS=1 \
+  WEDDING_CLOUD_SPEND_CAP_USD=180 \
+  .venv/bin/python -m webapp.worker.runner
+```
+
+Tuning:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `WEDDING_EXECUTOR` | `local` | Set to `cloud` to run durable units on RunPod pods. |
 | `WEDDING_CLOUD_MAX_SLOTS` | `16` | Pods brought up in parallel. |
-| `WEDDING_CLOUD_SPEND_CAP_USD` | `250` | Fleet stops launching pods past this estimated spend (checked at bring-up only). |
+| `WEDDING_CLOUD_SPEND_CAP_USD` | `250` | Hard ceiling on the job's accrued pod spend: a watchdog tears the whole fleet down the moment it is reached (also checked before each bring-up). Keep it below your RunPod balance. |
 | `WEDDING_CLOUD_TIER` | `SECURE` | RunPod cloud tier. |
 | `WEDDING_CLOUD_GPU_PREFERENCE` | — | Preferred `gpuTypeId`s, in order. |
 

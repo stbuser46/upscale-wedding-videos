@@ -642,7 +642,8 @@ def _validate_and_complete(settings: Settings, job) -> None:
     actual_frames = int(video.get("nb_read_frames") or 0)
     if actual_frames != expected_frames:
         raise WorkerError(f"Output frame validation failed: expected {expected_frames}, found {actual_frames}")
-    baseline = Path(job["baseline_path"])
+    # baseline_path is nullable (durable/cloud jobs produce no baseline).
+    baseline = Path(job["baseline_path"]) if job["baseline_path"] else Path("/nonexistent")
     log = Path(job["log_path"])
     with connect(settings.database_path) as db, transaction(db):
         _register_file(settings, db, job["id"], "restored_output", output, "video/x-matroska", media, round(actual_duration * 1000), actual_frames)
@@ -1184,10 +1185,12 @@ def _run_units_cloud(settings: Settings, job) -> int:
     assemble locally. Mirrors _run_units' durable/resume/validation contract; the
     only difference is many units run at once on pods instead of one at a time
     on the local card."""
+    import threading as _threading
+    from collections import deque
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from webapp.cloud.fleet import CloudFleet
-    from webapp.cloud.executor import run_unit_remote
-    from webapp.worker.slicer import slice_unit, SliceError
+    from webapp.cloud import executor as cloud_exec
+    from webapp.worker.slicer import slice_unit, slice_frame_hash, SliceError
     global _ACTIVE_FLEET
 
     source = _allowed_source(settings, job["source_cache_path"])
@@ -1212,15 +1215,6 @@ def _run_units_cloud(settings: Settings, job) -> int:
 
     _set_state(settings, job["id"], "running", "seedvr2_restore")
 
-    # Stage 1 locally (CPU) if not already present, so slices can be cut.
-    if not stage1.is_file():
-        _heartbeat(settings, "running", active_job_id=job["id"], detail="preparing 50p (deinterlace)")
-        rc = _run_prepare(settings, job, source, start_sec, duration, log)
-        if rc == STATUS_SHUTDOWN:
-            return STATUS_SHUTDOWN
-        if rc != 0 or not stage1.is_file():
-            raise WorkerError(f"stage-1 prepare failed (status {rc})")
-
     def stop_reason() -> str | None:
         if _SHUTDOWN:
             return "shutdown"
@@ -1240,7 +1234,9 @@ def _run_units_cloud(settings: Settings, job) -> int:
         reason = stop_reason()
         return reason if reason in ("cancel", "shutdown") else None
 
-    # Resume: skip units already valid on disk.
+    # Resume: skip units already valid on disk. Runs BEFORE stage-1 so a fully
+    # restored resume never re-prepares, and so the fleet can provision (pods
+    # take minutes to come up) WHILE the local deinterlace runs.
     pending = []
     for unit in units:
         upath = units_dir / f"unit_{unit['seq']:05d}.mkv"
@@ -1263,96 +1259,336 @@ def _run_units_cloud(settings: Settings, job) -> int:
         run_started = time.monotonic()
         frames_at_start = _units_frames_done(settings, job["id"]) or 0
         _unit_progress(settings, job, frames_at_start, run_started, frames_at_start)
-        errors: list[str] = []
-        # Units still waiting to acquire a slot. When this hits zero, a pod that
-        # finishes its unit has no more work, so it retires immediately instead
-        # of idling (and billing) until the whole job ends.
-        import threading as _threading
-        dispatch_lock = _threading.Lock()
-        to_dispatch = [len(pending)]
 
-        def process(unit) -> None:
-            if stop_reason():
-                return
-            upath = units_dir / f"unit_{unit['seq']:05d}.mkv"
-            spath = slices_dir / f"unit_{unit['seq']:05d}.mkv"
-            # Wait as long as the fleet can still hand out a slot; units queue for
-            # slots by design (many more units than pods). None => aborted or no
-            # pod will ever come up.
-            slot = fleet.acquire_slot(stop_check=lambda: stop_reason() is not None)
-            if slot is None:
-                if stop_reason():
+        # Shared dispatch state. Units flow queue -> slice -> upload -> restore
+        # -> download/validate -> completed; each pod runs that as a pipeline
+        # (upload N+1 and download N-1 overlap restore N, so the paid GPU never
+        # waits on the home link). A pod failure requeues its units for another
+        # pod, bounded by MAX_UNIT_ATTEMPTS so a poisoned unit cannot loop
+        # forever on fresh pods.
+        MAX_UNIT_ATTEMPTS = 2
+        state_lock = _threading.Lock()
+        queue = deque(pending)
+        attempts: dict[int, int] = {}
+        completed: set[int] = set()
+        errors: list[str] = []
+        slice_ready = {u["seq"]: _threading.Event() for u in pending}
+        slice_error: dict[int, str] = {}
+        # Per-slice framemd5 digest: lets a pod receive its slice from the seed
+        # pod (datacenter-side) after PROVING it identical to the local cut.
+        slice_hashes: dict[int, str] = {}
+        # Bound how far slicing runs ahead of the pods (~220 MB per slice on
+        # disk); a slot is released when its unit reaches a terminal state.
+        slice_budget = _threading.Semaphore(max(4, 2 * n_slots))
+        dispatch_done = _threading.Event()
+        tail_seq = units[-1]["seq"]
+
+        def fatal_stop() -> bool:
+            return stop_reason() is not None or fleet.capped
+
+        def queue_has_work() -> bool:
+            with state_lock:
+                return bool(queue)
+
+        def pop_unit():
+            with state_lock:
+                if stop_reason() is not None or fleet.capped:
+                    return None
+                return queue.popleft() if queue else None
+
+        def requeue_quietly(unit) -> None:
+            """Put back a unit that was popped but never attempted (pause hit,
+            or its pod went suspect before it started) — no attempt charged."""
+            with state_lock:
+                queue.appendleft(unit)
+
+        def unit_failed(unit, why: str) -> None:
+            """An attempted unit failed: requeue it for another pod, or record
+            a terminal error once its attempts are spent. The slice file is
+            kept while a retry is still possible."""
+            seq = unit["seq"]
+            _record_chunk(settings, job["id"], unit, units_dir / f"unit_{seq:05d}.mkv", "invalid")
+            with state_lock:
+                attempts[seq] = attempts.get(seq, 0) + 1
+                if attempts[seq] < MAX_UNIT_ATTEMPTS and not (stop_reason() is not None or fleet.capped):
+                    queue.appendleft(unit)
                     return
-                raise WorkerError("no cloud GPU became available")
-            with dispatch_lock:
-                to_dispatch[0] -= 1  # this unit no longer needs a slot
-            # A pod that fails or times out its unit is suspect: retire it rather
-            # than recycle it into the next unit (a wedged pod would just fail
-            # that one too, while billing). A local slice failure leaves the pod
-            # unused and healthy, so it is handed back.
-            slot_healthy = True
+                errors.append(f"unit {seq}: {why}")
+            slice_budget.release()
+
+        def slice_ahead() -> None:
+            """Cut slices in unit order, a bounded distance ahead of the pods,
+            starting while the fleet is still provisioning. Every unit's event
+            is set eventually, so no consumer can wait forever."""
+            for unit in pending:
+                seq = unit["seq"]
+                got = False
+                while not got:
+                    got = slice_budget.acquire(timeout=5.0)
+                    if dispatch_done.is_set() or fatal_stop():
+                        break
+                if dispatch_done.is_set() or fatal_stop():
+                    if got:
+                        slice_budget.release()
+                    slice_ready[seq].set()
+                    continue
+                spath = slices_dir / f"unit_{seq:05d}.mkv"
+                try:
+                    slice_unit(stage1, unit["skip"], unit["cap"], spath,
+                               fps=_output_fps(snapshot),
+                               ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir,
+                               allow_short=(seq == tail_seq))
+                    try:
+                        slice_hashes[seq] = slice_frame_hash(
+                            spath, ffmpeg_image=settings.ffmpeg_image,
+                            data_dir=settings.data_dir)
+                    except Exception:
+                        pass  # no hash -> this unit just skips the peer path
+                except SliceError as exc:
+                    with state_lock:
+                        slice_error[seq] = str(exc)
+                        try:
+                            queue.remove(unit)
+                        except ValueError:
+                            pass  # already popped; the waiter drops it via slice_error
+                        errors.append(f"unit {seq}: slice failed: {exc}")
+                    slice_budget.release()
+                finally:
+                    slice_ready[seq].set()
+
+        def next_ready_unit():
+            """Pop the next unit and wait (stop-aware poll) for its slice."""
+            while True:
+                unit = pop_unit()
+                if unit is None:
+                    return None
+                seq = unit["seq"]
+                while not slice_ready[seq].wait(timeout=5.0):
+                    if fatal_stop():
+                        requeue_quietly(unit)
+                        return None
+                with state_lock:
+                    if seq in slice_error:
+                        continue  # slicer already recorded the failure; next unit
+                if fatal_stop():
+                    requeue_quietly(unit)
+                    return None
+                return unit
+
+        def finalize_unit(slot, unit, pod_bad) -> None:
+            """Download + validate one restored unit. Runs in a helper thread so
+            the pod can start restoring its next (already uploaded) unit
+            immediately instead of idling through the pull."""
+            seq = unit["seq"]
+            upath = units_dir / f"unit_{seq:05d}.mkv"
+            spath = slices_dir / f"unit_{seq:05d}.mkv"
             try:
-                if stop_reason():
-                    return
-                slice_unit(stage1, unit["skip"], unit["cap"], spath,
-                           fps=_output_fps(snapshot),
-                           ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir,
-                           allow_short=(unit["seq"] == len(units) - 1))
-                _record_chunk(settings, job["id"], unit, upath, "running")
-                _heartbeat(settings, "running", active_job_id=job["id"],
-                           detail=f"cloud: {fleet.ready}/{n_slots} slots, unit {unit['seq'] + 1}/{len(units)}")
-                res = run_unit_remote(
-                    slot.endpoint, cfg.ssh_key, slice_path=spath, local_out=upath, unit=unit,
-                    model=model, resolution=resolution, batch=batch, overlap=overlap,
-                    log_path=log, should_abort=lambda: hard_stop() is not None,
-                )
-                spath.unlink(missing_ok=True)
+                res = cloud_exec.download_unit(
+                    slot.endpoint, cfg.ssh_key, local_out=upath, unit=unit,
+                    log_path=log, should_abort=lambda: hard_stop() is not None)
                 if res.status == -1:  # aborted (stop requested)
                     return
                 if res.status != 0:
-                    slot_healthy = False  # remote failure/timeout -> retire the pod
-                    _record_chunk(settings, job["id"], unit, upath, "invalid")
-                    raise WorkerError(f"unit {unit['seq']} failed on pod: {res.message}")
+                    pod_bad.set()  # its network is suspect; stop feeding it
+                    unit_failed(unit, f"download failed from pod {slot.pod_id}: {res.message}")
+                    return
                 actual = _probe_frame_count(settings, upath)
                 local_unit = unit
                 if actual != unit["new"]:
                     shortfall = unit["new"] - actual
-                    if unit["seq"] == len(units) - 1 and 0 < shortfall <= 50:
+                    if seq == tail_seq and 0 < shortfall <= 50:
                         _set_frames_total(settings, job["id"], unit["start"] + actual)
                         local_unit = {**unit, "new": actual}
                     else:
-                        _record_chunk(settings, job["id"], unit, upath, "invalid")
-                        raise WorkerError(f"unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
+                        unit_failed(unit, f"produced {actual} frames, expected {unit['new']}")
+                        return
                 _record_chunk(settings, job["id"], local_unit, upath, "valid", frame_count=actual)
+                with state_lock:
+                    completed.add(seq)
+                spath.unlink(missing_ok=True)
+                slice_budget.release()
+                # Completing a unit is proof the pod is alive: refresh its TTL
+                # clock. (A pipelined pod never re-enters the slot queue, so
+                # this replaces hand_back()'s refresh.)
+                slot.created_at = time.monotonic()
                 done = _units_frames_done(settings, job["id"])
                 if done is not None:
                     _unit_progress(settings, job, done, run_started, frames_at_start)
-            finally:
-                if slot is not None:
-                    if not slot_healthy:
-                        # Pod failed/timed out this unit -> terminate it now so it
-                        # stops billing and is never handed the next unit.
-                        fleet.retire_slot(slot)
-                    else:
-                        # More units still waiting for a slot -> hand it back.
-                        # None left -> retire the pod now so it stops billing.
-                        with dispatch_lock:
-                            more_work = to_dispatch[0] > 0
-                        if more_work:
-                            fleet.hand_back(slot)  # refreshes the pod's TTL clock
+            except Exception as exc:  # never lose a unit to a validator crash
+                unit_failed(unit, f"validation failed: {exc}")
+
+        def deliver_slice(slot, unit):
+            """Get a unit's slice onto the pod. Preferred: cut it on the seed
+            pod holding the stage-1 intermediate and copy it pod-to-pod, PROVEN
+            decoded-identical to the local cut via its framemd5 digest — the
+            multi-GB intermediate then crosses the home link once per job
+            instead of once per unit. Fallback: today's home upload."""
+            seq = unit["seq"]
+            digest = slice_hashes.get(seq)
+            if digest is not None and fleet.intermediate_seed(stage1) is not None:
+                ss = f"{unit['skip'] / _output_fps(snapshot):.6f}"
+                if fleet.slice_from_seed(slot.endpoint, ss=ss, cap=unit["cap"],
+                                         name=f"unit_{seq:05d}.mkv", expected_hash=digest):
+                    return cloud_exec.UnitResult(status=0)
+            return cloud_exec.upload_unit_slice(
+                slot.endpoint, cfg.ssh_key,
+                slice_path=slices_dir / f"unit_{seq:05d}.mkv",
+                unit=unit, log_path=log)
+
+        def pod_runner(idx: int) -> None:
+            """Own one pod for its whole life. A pod that fails or times out a
+            unit is suspect: its units go back to the queue for other pods and
+            it is retired rather than recycled (a wedged pod would just fail the
+            next unit too, while billing). Retires the pod the moment there is
+            no more work for it."""
+            slot = fleet.acquire_slot(
+                stop_check=lambda: fatal_stop() or not queue_has_work())
+            if slot is None:
+                # Queue drained with no pod acquired: make sure no unclaimed or
+                # late-arriving pod is left billing with nobody to retire it.
+                if not fatal_stop() and not queue_has_work():
+                    fleet.mark_no_more_work()
+                return
+            pod_bad = _threading.Event()
+            finalizers: list[_threading.Thread] = []
+            try:
+                current = next_ready_unit()
+                if current is not None:
+                    up = deliver_slice(slot, current)
+                    if up.status != 0:
+                        unit_failed(current, up.message)
+                        pod_bad.set()
+                        current = None
+                while current is not None:
+                    reason = stop_reason()
+                    if reason is not None or fleet.capped:
+                        if reason == "pause":
+                            requeue_quietly(current)  # popped but never started
+                        break
+                    if pod_bad.is_set():
+                        requeue_quietly(current)  # pod is suspect; run it elsewhere
+                        break
+                    seq = current["seq"]
+                    _record_chunk(settings, job["id"], current,
+                                  units_dir / f"unit_{seq:05d}.mkv", "running")
+                    _heartbeat(settings, "running", active_job_id=job["id"],
+                               detail=f"cloud: {fleet.ready} pod(s), unit {seq + 1}/{len(units)}")
+                    # Prefetch: upload the next unit's slice to this pod while it
+                    # restores the current one (rsync does not touch the GPU).
+                    nxt_box: dict = {}
+
+                    def prefetch(box=nxt_box, slot=slot, bad=pod_bad):
+                        if bad.is_set():
+                            return
+                        # Courtesy: while sibling pods are still provisioning,
+                        # don't strip the queue bare — leave them units to land
+                        # on (matters when there are about as many units as
+                        # pods; irrelevant for long chapter queues).
+                        with state_lock:
+                            qlen = len(queue)
+                        if not fleet.provisioning_done() and qlen <= max(0, n_slots - fleet.ready):
+                            return
+                        unit = next_ready_unit()
+                        if unit is None:
+                            return
+                        res = deliver_slice(slot, unit)
+                        if res.status == 0:
+                            box["unit"] = unit
                         else:
-                            fleet.retire_slot(slot)
+                            # Never abort a paid in-flight restore over a
+                            # prefetch blip: send the unit to another pod and
+                            # stop feeding this one.
+                            unit_failed(unit, res.message)
+                            bad.set()
+
+                    pre = _threading.Thread(target=prefetch, daemon=True,
+                                            name=f"prefetch-{idx}")
+                    pre.start()
+                    rres = cloud_exec.restore_unit(
+                        slot.endpoint, cfg.ssh_key,
+                        slice_name=f"unit_{seq:05d}.mkv", out_name=f"unit_{seq:05d}.mkv",
+                        unit=current, model=model, resolution=resolution,
+                        batch=batch, overlap=overlap, log_path=log,
+                        should_abort=lambda: hard_stop() is not None)
+                    pre.join()
+                    nxt = nxt_box.get("unit")
+                    if rres.status == -1:  # aborted (stop requested)
+                        if nxt is not None:
+                            requeue_quietly(nxt)
+                        break
+                    if rres.status != 0:
+                        unit_failed(current, f"restore failed on pod: {rres.message}")
+                        if nxt is not None:
+                            requeue_quietly(nxt)
+                        pod_bad.set()
+                        break
+                    # Restore done: hand download/validation to a helper so the
+                    # next (already uploaded) unit starts on the GPU right away.
+                    fin = _threading.Thread(target=finalize_unit, args=(slot, current, pod_bad),
+                                            daemon=True, name=f"finalize-{idx}")
+                    fin.start()
+                    finalizers.append(fin)
+                    current = nxt
+            finally:
+                # The pod must outlive its in-flight downloads.
+                for t in finalizers:
+                    t.join()
+                if hard_stop() is None and not fleet.capped:
+                    # No more work / pause / pod suspect: stop billing now.
+                    fleet.retire_slot(slot)
+                    if stop_reason() is None and not queue_has_work():
+                        # This may be the last working pod: sweep any sibling
+                        # still provisioning or queued so it can't bill idle.
+                        fleet.mark_no_more_work()
+                # On cancel/shutdown/cap, terminate_all()/__exit__ owns teardown.
+
+        beat_stop = _threading.Event()
+
+        def beater() -> None:
+            """Refresh the heartbeat during multi-minute remote restores, so the
+            UI never declares the worker down mid-unit."""
+            base_done = len(units) - len(pending)
+            while not beat_stop.wait(20.0):
+                with state_lock:
+                    ndone = base_done + len(completed)
+                _best_effort(lambda: _heartbeat(
+                    settings, "running", active_job_id=job["id"],
+                    detail=f"cloud: {fleet.ready} pod(s) up, {ndone}/{len(units)} units done"))
 
         with CloudFleet(settings, job, cfg, log=lambda m: print(m, flush=True)) as fleet:
             _ACTIVE_FLEET = fleet
             try:
                 fleet.provision(n_slots)
-                with ThreadPoolExecutor(max_workers=n_slots) as ex:
-                    futures = {ex.submit(process, u): u for u in pending}
-                    for fut in as_completed(futures):
-                        exc = fut.exception()
-                        if exc is not None:
-                            errors.append(str(exc))
+                # Stage 1 (local CPU) runs while the pods bring up; a prepare
+                # failure still tears the fleet down via __exit__.
+                if not stage1.is_file():
+                    _heartbeat(settings, "running", active_job_id=job["id"],
+                               detail="preparing 50p (deinterlace)")
+                    rc = _run_prepare(settings, job, source, start_sec, duration, log)
+                    if rc == STATUS_SHUTDOWN:
+                        return STATUS_SHUTDOWN
+                    if rc != 0 or not stage1.is_file():
+                        raise WorkerError(f"stage-1 prepare failed (status {rc})")
+                slicer_thread = _threading.Thread(target=slice_ahead, daemon=True,
+                                                  name="cloud-slicer")
+                slicer_thread.start()
+                # One-time background upload of the intermediate to the fleet's
+                # best-ingress pod; until it lands, units use home uploads.
+                fleet.start_intermediate_staging(stage1)
+                beat_thread = _threading.Thread(target=beater, daemon=True, name="cloud-beat")
+                beat_thread.start()
+                try:
+                    with ThreadPoolExecutor(max_workers=n_slots) as ex:
+                        futures = [ex.submit(pod_runner, i) for i in range(n_slots)]
+                        for fut in as_completed(futures):
+                            exc = fut.exception()
+                            if exc is not None:
+                                with state_lock:
+                                    errors.append(str(exc))
+                finally:
+                    dispatch_done.set()
+                    beat_stop.set()
+                    slicer_thread.join(timeout=120)
             finally:
                 _ACTIVE_FLEET = None
 
@@ -1372,6 +1608,9 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 f"cloud spend cap ${cfg.spend_cap_usd:.0f} reached; fleet torn down with "
                 f"{done}/{job['frames_total']} frames done. Raise WEDDING_CLOUD_SPEND_CAP_USD "
                 f"and resume to continue from the finished units.")
+        with state_lock:
+            if queue:
+                errors.append(f"{len(queue)} unit(s) never ran (no cloud GPU available for them)")
         if errors:
             raise WorkerError(f"{len(errors)} unit(s) failed: {errors[0]}")
 

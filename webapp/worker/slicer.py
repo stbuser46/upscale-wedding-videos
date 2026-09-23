@@ -108,6 +108,45 @@ def slice_unit(
     return dest
 
 
+def slice_frame_hash(
+    path: Path,
+    *,
+    ffmpeg_image: str = "linuxserver/ffmpeg:latest",
+    data_dir: Path | None = None,
+    use_docker: bool = True,
+) -> str:
+    """sha256 over a slice's per-frame framemd5 hashes (decoded content only —
+    mux metadata and timestamps excluded). Computed to byte-match the pod-side
+    `ffmpeg -f framemd5 - | grep -v '^#' | awk '{print $NF}' | sha256sum`, so a
+    remote-cut slice can be PROVEN decoded-identical to the local cut before a
+    pod is allowed to restore it."""
+    import hashlib
+
+    path = Path(path).resolve()
+    if use_docker:
+        if data_dir is None:
+            raise SliceError("data_dir is required for the dockerised hasher")
+        data_dir = Path(data_dir).resolve()
+        rel = path.relative_to(data_dir)
+        cmd = [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", f"{data_dir}:/data:ro",
+            "--entrypoint", "ffmpeg", ffmpeg_image,
+            "-v", "error", "-i", f"/data/{rel}", "-f", "framemd5", "-",
+        ]
+    else:
+        cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-f", "framemd5", "-"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SliceError(f"framemd5 failed ({result.returncode}): {result.stderr.strip()[:200]}")
+    tokens = [line.split()[-1] for line in result.stdout.splitlines()
+              if line.strip() and not line.startswith("#")]
+    if not tokens:
+        raise SliceError(f"framemd5 produced no frame lines for {path}")
+    digest = hashlib.sha256("".join(t + "\n" for t in tokens).encode()).hexdigest()
+    return digest
+
+
 def probe_frame_count(
     path: Path,
     *,
