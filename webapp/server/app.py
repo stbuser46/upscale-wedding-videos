@@ -12,6 +12,7 @@ from webapp.config import Settings, load_settings
 from webapp.db import connect, migrate
 from webapp.server.api import api
 from webapp.server.auth import csrf_protect, ensure_csrf_token, login_rate_limited, password_matches
+from webapp.server.cloud_metrics import start_cloud_metrics_sampler
 from webapp.server.cloud_views import cloud
 from webapp.server.metrics import start_sampler
 
@@ -49,6 +50,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     app.register_blueprint(api)
     app.register_blueprint(cloud)
     start_sampler(settings)
+    start_cloud_metrics_sampler(settings)
 
     @app.before_request
     def security_gate():

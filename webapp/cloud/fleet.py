@@ -46,6 +46,7 @@ class Slot:
     gpu_type: str
     hourly_rate: float
     created_at: float  # monotonic, for TTL
+    ledger_id: int | None = None  # this pod's OWN cloud_pods row (per-attempt)
 
 
 @dataclass
@@ -58,6 +59,7 @@ class FleetConfig:
     pod_ttl_s: float = 3600.0          # terminate a pod older than this (unit ~15 min)
     container_disk_gb: int = 40           # a pod uses ~16 GiB (base+weights+cache); 120 caused 'no resources' rejections
     bring_up_attempts: int = 3            # recreate on a create-reject or no-ssh dud
+    max_tree_upload_s: float = 60.0       # ingress gate: 6 MB tree slower than this = hopeless host
     ssh_timeout_s: int = 300              # working pods answer in ~100 s; give up on a dud fast
     ssh_key: Path = DEFAULT_SSH_KEY
     provision_dir: Path = field(default=None)   # local docker/seedvr2-pod dir
@@ -90,6 +92,10 @@ class CloudFleet:
         # during provisioning), the pod currently holding the intermediate, and
         # the lazily-started one-at-a-time staging upload.
         self._ingress_hint: dict[tuple[str, int], float] = {}
+        # At most 2 concurrent tree uploads: the ingress gate must measure the
+        # HOST's route, not self-inflicted contention from 8 parallel probes
+        # over one home uplink (Codex round-2 finding #10).
+        self._probe_gate = threading.Semaphore(2)
         self._inter_lock = threading.Lock()
         self._inter_seed: tuple[str, int] | None = None
         self._inter_thread: threading.Thread | None = None
@@ -103,28 +109,33 @@ class CloudFleet:
     # ---------------------------------------------------------------- ledger
 
     def _ledger(self, pod_name: str, **fields) -> None:
+        """Name-based ledger update — ONLY for pods with no known row id (API
+        strays swept by terminate_all). Per-attempt updates use _ledger_row."""
         cols = ", ".join(f"{k}=:{k}" for k in fields)
         with connect(self.settings.database_path) as db:
-            # Only ever touch this run's live row. Pod names repeat across runs
-            # (wedding-<public_id>-<index>) and rows are never deleted, so a bare
-            # WHERE name=:name would also match a prior attempt's terminated row
-            # and drive both to the same pod_id -> UNIQUE violation, which broke
-            # every resume/retry of a cloud job. Prior rows are terminated on
-            # teardown/reconcile, so terminated_at IS NULL isolates the current
-            # one. (A terminating UPDATE still matches: the row is NULL until
-            # this very statement sets it.)
             db.execute(f"UPDATE cloud_pods SET {cols} WHERE name=:name AND terminated_at IS NULL",
                        {**fields, "name": pod_name})
 
-    def _ledger_insert(self, pod_name: str, gpu_type: str, rate: float) -> None:
+    def _ledger_row(self, row_id: int, **fields) -> None:
+        """Update ONE physical pod attempt's row by primary key. Every create
+        attempt gets its own row (Codex finding #2: a shared name-keyed row let
+        a later attempt overwrite an unconfirmed dud's identity, hiding its
+        spend and colliding on the pod_id UNIQUE constraint)."""
+        cols = ", ".join(f"{k}=:{k}" for k in fields)
         with connect(self.settings.database_path) as db:
-            db.execute(
+            db.execute(f"UPDATE cloud_pods SET {cols} WHERE id=:row_id",
+                       {**fields, "row_id": row_id})
+
+    def _ledger_insert(self, pod_name: str, gpu_type: str, rate: float) -> int:
+        with connect(self.settings.database_path) as db:
+            cur = db.execute(
                 """INSERT INTO cloud_pods (name, gpu_type, hourly_rate, cloud_type,
                                            state, job_id, created_at)
                    VALUES (:name, :gpu, :rate, :cloud, 'creating', :job_id, :now)""",
                 {"name": pod_name, "gpu": gpu_type, "rate": rate,
                  "cloud": self.cfg.cloud_type, "job_id": self.job["id"], "now": _now_iso()},
             )
+            return int(cur.lastrowid)
 
     def spend_so_far(self) -> float:
         with connect(self.settings.database_path) as db:
@@ -133,12 +144,20 @@ class CloudFleet:
                 (self.job["id"],),
             ).fetchall()
         now = datetime.now(timezone.utc)
+
+        def _aware(ts: str) -> datetime:
+            # Tolerate naive timestamps (e.g. a manual SQL fix using SQLite's
+            # datetime('now')): treat them as UTC rather than crashing the
+            # spend guard — this bit live on 2026-09-24.
+            dt = datetime.fromisoformat(ts)
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
         total = 0.0
         for r in rows:
             if not r["created_at"] or r["hourly_rate"] is None:
                 continue
-            start = datetime.fromisoformat(r["created_at"])
-            end = datetime.fromisoformat(r["terminated_at"]) if r["terminated_at"] else now
+            start = _aware(r["created_at"])
+            end = _aware(r["terminated_at"]) if r["terminated_at"] else now
             total += r["hourly_rate"] * max(0.0, (end - start).total_seconds()) / 3600.0
         return total
 
@@ -176,15 +195,51 @@ class CloudFleet:
             #    ceiling — bring-up alone can't bound it.
             try:
                 spent = self.spend_so_far()
-            except Exception as exc:  # never let a DB blip disable the guard silently
-                self.log(f"[fleet] WARN watchdog spend check failed: {exc}")
-                spent = 0.0
+                self._spend_check_failures = 0
+            except Exception as exc:
+                # FAIL CLOSED: a broken spend query means the cap is
+                # unenforceable — blind billing is the one unacceptable state
+                # (Codex finding #8: the old 0.0 fallback disabled the guard).
+                self._spend_check_failures = getattr(self, "_spend_check_failures", 0) + 1
+                self.log(f"[fleet] WARN watchdog spend check failed "
+                         f"({self._spend_check_failures}/3): {exc}")
+                if self._spend_check_failures >= 3:
+                    self._capped = True
+                    self.log("[fleet] spend cap UNVERIFIABLE for 3 checks; "
+                             "failing closed — tearing down the whole fleet NOW")
+                    self.terminate_all()
+                    return
+                continue
             if spent >= self.cfg.spend_cap_usd:
                 self._capped = True
                 self.log(f"[fleet] SPEND CAP ${self.cfg.spend_cap_usd:.2f} reached "
                          f"(accrued ${spent:.2f}); tearing down the whole fleet NOW")
                 self.terminate_all()
                 return
+            # 1b) Close 'create unconfirmed' rows once the provider verifiably
+            #     does not know the pod: they accrue conservatively by design,
+            #     but left open they pile up phantom spend and falsely trip
+            #     the cap (observed: 6 rows ≈ $12.5/h of fiction). 3 minutes
+            #     is far beyond RunPod's create-visibility window.
+            try:
+                with connect(self.settings.database_path) as db:
+                    stale_rows = db.execute(
+                        """SELECT id, name, created_at FROM cloud_pods
+                           WHERE job_id=? AND terminated_at IS NULL AND pod_id IS NULL
+                             AND state='terminating' AND error LIKE 'create unconfirmed%'""",
+                        (self.job["id"],)).fetchall()
+                if stale_rows:
+                    known = {p.get("name") for p in self.client.our_pods()}
+                    cutoff = datetime.now(timezone.utc)
+                    for row in stale_rows:
+                        age = (cutoff - datetime.fromisoformat(row["created_at"])).total_seconds()
+                        if age > 180 and row["name"] not in known:
+                            self._ledger_row(row["id"], state="terminated",
+                                             terminated_at=_now_iso())
+                            self.log(f"[fleet] closed unconfirmed-create row {row['id']} "
+                                     f"(provider verified absent)")
+            except Exception:
+                pass
             # 2) TTL backstop: retire a pod that has run `pod_ttl_s` without
             #    finishing a unit. hand_back() refreshes the clock each completed
             #    unit, so a healthy pod chewing through units never trips this;
@@ -203,6 +258,55 @@ class CloudFleet:
         """True once every bring-up thread has finished (readied or failed)."""
         return bool(self._threads) and all(not t.is_alive() for t in self._threads)
 
+    def request_replacement(self) -> None:
+        """A working pod died with units still queued: bring up a replacement
+        so fleet capacity recovers instead of only ever shrinking (the
+        2026-09-24 run decayed 6→2 pods and had to be manually restarted).
+        Bounded by max_slots total replacements, the spend cap, and the usual
+        bring-up guards."""
+        with self._lock:
+            if self._stop.is_set() or self._no_more_work.is_set():
+                return
+            if getattr(self, "_replacements", 0) >= self.cfg.max_slots:
+                self.log("[fleet] replacement budget exhausted; not replacing pod")
+                return
+            self._replacements = getattr(self, "_replacements", 0) + 1
+            index = self._requested + self._replacements + 100  # distinct pod name suffix
+        self.log(f"[fleet] bringing up replacement pod {index}")
+        t = threading.Thread(target=self._bring_up, args=(index,), daemon=True,
+                             name=f"fleet-pod-{index}")
+        t.start()
+        self._threads.append(t)
+
+    def relay_download(self, bad: tuple[str, int], *, remote_name: str,
+                       local_out: Path, should_abort=lambda: False) -> bool:
+        """Home cannot reach `bad` (rate-limited/blocked route) but a sibling
+        pod usually can: pull the finished unit pod-to-pod, then download it
+        from the sibling. Saves a fully-paid restore from being redone
+        (2026-09-24: a home-IP rate limit burned three finished units)."""
+        remote_path = f"/workspace/units/{remote_name}"
+        relay_path = f"/workspace/relay_{remote_name}"
+        vias = [e for e in self._live_endpoints() if e != bad]
+        for via in vias[:2]:
+            if should_abort():
+                return False
+            try:
+                run_ssh(via, ["scp", "-P", str(bad[1]), "-i", "/opt/jobkey",
+                              "-o", "StrictHostKeyChecking=no",
+                              "-o", "UserKnownHostsFile=/dev/null",
+                              f"root@{bad[0]}:{remote_path}", relay_path],
+                        ssh_key=self.cfg.ssh_key, timeout=300)
+                rsync(via, local_out, relay_path, upload=False,
+                      ssh_key=self.cfg.ssh_key, timeout=1800, abort_check=should_abort)
+                run_ssh(via, ["rm", "-f", relay_path], ssh_key=self.cfg.ssh_key,
+                        timeout=30, check=False)
+                if local_out.is_file() and local_out.stat().st_size > 0:
+                    self.log(f"[fleet] relayed {remote_name} from {bad[0]} via {via[0]}")
+                    return True
+            except Exception as exc:
+                self.log(f"[fleet] relay via {via[0]} failed: {str(exc)[:80]}")
+        return False
+
     def acquire_slot(self, stop_check: Callable[[], bool] = lambda: False, poll: float = 10.0):
         """Block until a slot is free, then return it. Units legitimately queue
         for slots when there are more units than pods (258 units over 16 slots is
@@ -215,7 +319,11 @@ class CloudFleet:
             if stop_check() or self._stop.is_set():
                 return None
             try:
-                return self.slot_queue.get(timeout=poll)
+                slot = self.slot_queue.get(timeout=poll)
+                with self._lock:
+                    if slot.pod_id not in self._slots:
+                        continue  # corpse: retired (e.g. by TTL) while queued
+                return slot
             except Empty:
                 with self._lock:
                     no_live_slots = len(self._slots) == 0
@@ -229,12 +337,15 @@ class CloudFleet:
         becomes READY after the queue drained bills unowned until job end —
         observed live 2026-09-23, where exactly that idle pod burned the
         spend-cap margin while another pod restored the last unit."""
-        self._no_more_work.set()
-        while True:
-            try:
-                slot = self.slot_queue.get_nowait()
-            except Empty:
-                break
+        stranded: list[Slot] = []
+        with self._lock:
+            self._no_more_work.set()
+            while True:
+                try:
+                    stranded.append(self.slot_queue.get_nowait())
+                except Empty:
+                    break
+        for slot in stranded:
             self.log(f"[fleet] retiring unclaimed pod {slot.pod_id} (no work remains)")
             self.retire_slot(slot)
 
@@ -252,7 +363,7 @@ class CloudFleet:
         with self._lock:
             self._slots.pop(slot.pod_id, None)
             self._ready = max(0, self._ready - 1)
-        self._terminate(slot.pod_id, slot.name)
+        self._terminate(slot.pod_id, slot.name, ledger_id=slot.ledger_id)
         self.log(f"[fleet] retired idle pod {slot.pod_id} (no more units)")
 
     def _bring_up(self, index: int) -> None:
@@ -265,13 +376,18 @@ class CloudFleet:
         name = f"{POD_NAME_PREFIX}{self.job['public_id']}-{index}"
         gpu_type = self.cfg.gpu_type_ids[0]
         rate = 0.0
-        offers = {o.id: o for o in self.client.usable_gpu_offers(
-            secure=self.cfg.cloud_type == "SECURE")}
-        for gid in self.cfg.gpu_type_ids:
-            if gid in offers:
-                gpu_type, rate = gid, offers[gid].price_per_hr or 0.0
-                break
-        self._ledger_insert(name, gpu_type, rate)
+        try:
+            offers = {o.id: o for o in self.client.usable_gpu_offers(
+                secure=self.cfg.cloud_type == "SECURE")}
+            for gid in self.cfg.gpu_type_ids:
+                if gid in offers:
+                    gpu_type, rate = gid, offers[gid].price_per_hr or 0.0
+                    break
+        except Exception as exc:
+            # A pricing-API blip must not silently cost the slot; create with
+            # the preferred type and let the ledger pick up the real rate from
+            # the create response (review finding A9).
+            self.log(f"[fleet] WARN offers lookup failed for pod {index}: {str(exc)[:80]}")
 
         # A bring-up can fail two ways that a FRESH pod usually fixes: RunPod
         # rejects the create (the machine it picked is full), or the pod comes up
@@ -285,18 +401,37 @@ class CloudFleet:
                 return
             if self._no_more_work.is_set():
                 self.log(f"[fleet] pod {index} bring-up abandoned (no work remains)")
-                self._ledger(name, state="terminated", error="abandoned: no work remains",
-                             terminated_at=_now_iso())
                 return
             if self.spend_so_far() >= self.cfg.spend_cap_usd:
                 self.log(f"[fleet] spend cap reached; stop bringing up pod {index}")
                 break
             pod_id = None
+            # One ledger row per PHYSICAL create attempt, inserted before the
+            # POST so a crash can never leave a billable pod unrecorded.
+            row_id = self._ledger_insert(name, gpu_type, rate)
             try:
                 pod = self._create_pod(name)
                 pod_id = pod["id"]
-                self._ledger(name, pod_id=pod_id, state="creating",
-                             hourly_rate=pod.get("costPerHr") or rate)
+                eff_rate = pod.get("costPerHr") or rate
+                if not eff_rate or eff_rate <= 0:
+                    # FAIL CLOSED on unpriceable pods: a 0.0 rate makes the
+                    # spend watchdog blind to this pod forever (Codex round-2
+                    # finding #7).
+                    raise RunpodError(f"no positive price known for pod {pod_id}; refusing")
+                self._ledger_row(row_id, pod_id=pod_id, state="creating", hourly_rate=eff_rate)
+                # This pod is now attached to ITS row: close any earlier
+                # unconfirmed pid-less row for the same name (a lost-response
+                # create this attempt just adopted) so it can't double-accrue.
+                try:
+                    with connect(self.settings.database_path) as db:
+                        db.execute(
+                            """UPDATE cloud_pods SET state='terminated', terminated_at=?
+                               WHERE name=? AND id != ? AND pod_id IS NULL
+                                 AND state='terminating' AND error LIKE 'create unconfirmed%'
+                                 AND terminated_at IS NULL""",
+                            (_now_iso(), name, row_id))
+                except Exception:
+                    pass
                 self.log(f"[fleet] pod {index} {pod_id} creating "
                          f"(attempt {attempt + 1}/{self.cfg.bring_up_attempts}, "
                          f"{gpu_type} ${pod.get('costPerHr') or rate}/h)")
@@ -306,37 +441,65 @@ class CloudFleet:
                     log=lambda m: None)
                 self.log(f"[fleet] pod {index} ssh up at {endpoint[0]}:{endpoint[1]} ({time.monotonic() - t_ssh:.0f}s)")
                 if self._stop.is_set():
-                    self._terminate(pod_id, name)
+                    self._terminate(pod_id, name, ledger_id=row_id)
                     return
                 self._provision_pod(endpoint, index)
-                if self._no_more_work.is_set():
-                    # Provisioned, but every unit is already handled: retire NOW
-                    # rather than queueing a pod nobody will ever claim.
-                    self.log(f"[fleet] pod {index} READY but no work remains; retiring")
-                    self._terminate(pod_id, name)
-                    return
                 slot = Slot(pod_id=pod_id, name=name, endpoint=endpoint, gpu_type=gpu_type,
-                            hourly_rate=pod.get("costPerHr") or rate, created_at=time.monotonic())
+                            hourly_rate=pod.get("costPerHr") or rate,
+                            created_at=time.monotonic(), ledger_id=row_id)
+                # Atomic with mark_no_more_work's drain: either this pod is
+                # registered+queued before the drain (and gets drained), or the
+                # flag is seen here and it never enters the queue — no window
+                # where a READY pod is queued after the drain and bills unowned.
                 with self._lock:
-                    self._slots[pod_id] = slot
-                    self._ready += 1
-                self._ledger(name, state="ready", ssh_host=endpoint[0], ssh_port=endpoint[1],
-                             ready_at=_now_iso(), last_seen_at=_now_iso())
+                    no_work = self._no_more_work.is_set()
+                    if not no_work:
+                        self._slots[pod_id] = slot
+                        self._ready += 1
+                        self.slot_queue.put(slot)
+                if no_work:
+                    self.log(f"[fleet] pod {index} READY but no work remains; retiring")
+                    self._terminate(pod_id, name, ledger_id=row_id)
+                    return
+                self._ledger_row(row_id, state="ready", ssh_host=endpoint[0], ssh_port=endpoint[1],
+                                 ready_at=_now_iso(), last_seen_at=_now_iso())
                 self.log(f"[fleet] pod {index} {pod_id} READY at {endpoint[0]}:{endpoint[1]}")
-                self.slot_queue.put(slot)
                 return  # success
             except Exception as exc:
                 last_exc = exc
                 self.log(f"[fleet] pod {index} attempt {attempt + 1} failed: {str(exc)[:120]}")
-                if pod_id is not None:
+                if pod_id is None:
+                    # Nothing confirmed created — but the POST may have landed
+                    # with the response lost. Do NOT close the row (a closed
+                    # row would hide a billing pod from spend accounting,
+                    # Codex round-2 finding #4): mark it 'unconfirmed' so it
+                    # keeps accruing conservatively; teardown closes leftover
+                    # unconfirmed pid-less rows after the provider sweeps
+                    # verify absence.
+                    # 'terminating' (schema CHECK allows no custom states): keeps
+                    # accruing conservatively; closed by adopt/teardown below.
+                    self._ledger_row(row_id, state="terminating",
+                                     error=f"create unconfirmed: {str(exc)[:300]}")
+                else:
                     try:
                         self.client.terminate_pod(pod_id)  # never leave the dud billing
-                    except RunpodError:
-                        pass
+                        self._ledger_row(row_id, state="terminated",
+                                         error=f"dud: {str(exc)[:300]}",
+                                         terminated_at=_now_iso())
+                    except RunpodError as kill_exc:
+                        # UNCONFIRMED dud delete: leave this attempt's own row
+                        # 'terminating' so its spend keeps accruing until the
+                        # reaper confirms it dead; the slot is abandoned rather
+                        # than reused (Codex finding #2).
+                        self.log(f"[fleet] pod {index} dud delete UNCONFIRMED "
+                                 f"({str(kill_exc)[:80]}); abandoning slot to the reaper")
+                        self._ledger_row(row_id, state="terminating",
+                                         error=f"dud delete unconfirmed: {str(kill_exc)[:200]}")
+                        return
+                # Back off between create attempts: immediate blind retries
+                # against a contended allocator just collect more 500s.
+                time.sleep(4 * (attempt + 1))
         self.log(f"[fleet] pod {index} gave up after {self.cfg.bring_up_attempts} attempts")
-        self._ledger(name, state="terminated",
-                     error=str(last_exc)[:400] if last_exc else "bring-up failed",
-                     terminated_at=_now_iso())
 
     def _create_pod(self, name: str) -> dict:
         """Create ONE pod, idempotently by name.
@@ -355,6 +518,11 @@ class CloudFleet:
         if existing is not None:
             self.log(f"[fleet] adopting existing pod {existing.get('id')} named {name}")
             return existing
+        # Re-check right before the POST: the name lookup above can be slow,
+        # and a create that fires after teardown started would land a pod
+        # after the final sweep (Codex round-2 finding #2).
+        if self._stop.is_set():
+            raise RunpodError("fleet stopping")
         try:
             return self.client.create_pod(
                 name=name, image=self.cfg.image, gpu_type_ids=self.cfg.gpu_type_ids,
@@ -398,7 +566,9 @@ class CloudFleet:
         the pods at teardown. It is NOT the operator key in cloud/keys/."""
         with self._cache_lock:
             if self._jobkey is None:
-                priv = self.cfg.provision_dir / "_jobkey"
+                # Per-JOB path: concurrent cloud workers must not overwrite
+                # each other's peer keys (Codex round-2 finding #12).
+                priv = self.cfg.provision_dir / f"_jobkey-{self.job['public_id']}"
                 pub = Path(f"{priv}.pub")
                 priv.unlink(missing_ok=True)
                 pub.unlink(missing_ok=True)
@@ -431,7 +601,6 @@ class CloudFleet:
             return
         seed: tuple[str, int] | None = None
         hold_home = False
-        deadline = time.monotonic() + 600
         with self._cache_cv:
             while seed is None and not hold_home:
                 if self._stop.is_set():
@@ -441,9 +610,13 @@ class CloudFleet:
                 elif not self._cache_home_busy:
                     self._cache_home_busy = True
                     hold_home = True
-                elif time.monotonic() > deadline:
-                    break  # never hang bring-up: fall through to a home upload
                 else:
+                    # Keep waiting — no deadline stampede: if the current home
+                    # uploader fails, its finally releases the token and wakes
+                    # us; if it succeeds we peer-fetch. A concurrent free-for-
+                    # all on a slow upstream is the one guaranteed-bad outcome
+                    # (review finding A4). Each home attempt is bounded by the
+                    # rsync timeout, so this cannot wait forever.
                     self._cache_cv.wait(timeout=5.0)
         fetched = False
         try:
@@ -521,8 +694,11 @@ class CloudFleet:
                  f"(one-time upload; slices will be cut there and passed pod-to-pod)")
         t0 = time.monotonic()
         try:
+            # Rate-capped so this multi-GB background upload never starves the
+            # first-wave slice uploads that pods are actively waiting on (the
+            # observed ~15-min GPU-idle ramp of 2026-09-24).
             rsync(target, local_path, REMOTE_INTERMEDIATE, upload=True,
-                  ssh_key=self.cfg.ssh_key, timeout=3600)
+                  ssh_key=self.cfg.ssh_key, timeout=7200, bwlimit_kbps=3000)
         except Exception as exc:
             self.log(f"[fleet] WARN intermediate staging failed ({str(exc)[:100]}); "
                      f"units continue via home uploads")
@@ -576,6 +752,7 @@ class CloudFleet:
                         ssh_key=self.cfg.ssh_key, timeout=300)
                 run_ssh(seed, ["rm", "-f", remote_slice], ssh_key=self.cfg.ssh_key, timeout=60)
             probe = run_ssh(target, ["bash", "-c",
+                                     f"set -o pipefail; "
                                      f"ffmpeg -v error -i {remote_slice} -f framemd5 - "
                                      f"| grep -v '^#' | awk '{{print $NF}}' | sha256sum"],
                             ssh_key=self.cfg.ssh_key, timeout=300)
@@ -590,6 +767,14 @@ class CloudFleet:
         except Exception as exc:
             self.log(f"[fleet] peer slice {name} failed ({str(exc)[:80]}); "
                      f"falling back to home upload")
+            # Never leave an UNPROVEN candidate at the target path: the
+            # fallback rsync's size/mtime quick-check could skip replacing it
+            # (Codex C finding). Best effort — the pod may be unreachable.
+            try:
+                run_ssh(target, ["rm", "-f", remote_slice], ssh_key=self.cfg.ssh_key,
+                        timeout=30, check=False)
+            except Exception:
+                pass
             return False
 
     def _provision_pod(self, endpoint, index: int) -> None:
@@ -609,10 +794,25 @@ class CloudFleet:
 
         # The pod runs the stock pytorch base; ship the already-patched 6 MB tree
         # copied out of the verified local image (byte-identical to production).
+        # This transfer doubles as the INGRESS GATE: a host that cannot take
+        # 6 MB inside max_tree_upload_s (~1 Mbit/s) will never sustain slice
+        # traffic — refuse it NOW, before 30 minutes of provisioning, instead
+        # of adopting it (the 81.27.69.177 host was adopted four times on
+        # 2026-09-24 and killed every pod placed on it). The measured time also
+        # seeds the ingress hint for EVERY pod, fixing seed selection, which
+        # previously only measured the single home cache uploader.
         tree = pdir / "_tree" / "SeedVR2"
-        step("uploaded SeedVR2 tree",
-             lambda: rsync(endpoint, f"{tree}/", "/opt/SeedVR2/", upload=True,
-                           ssh_key=cfg.ssh_key, timeout=600))
+        with self._probe_gate:
+            t_tree = time.monotonic()
+            step("uploaded SeedVR2 tree",
+                 lambda: rsync(endpoint, f"{tree}/", "/opt/SeedVR2/", upload=True,
+                               ssh_key=cfg.ssh_key, timeout=max(120, int(cfg.max_tree_upload_s) * 2)))
+            tree_s = time.monotonic() - t_tree
+        self._ingress_hint[endpoint] = tree_s
+        if tree_s > cfg.max_tree_upload_s:
+            raise RunpodError(
+                f"ingress gate: 6 MB tree took {tree_s:.0f}s "
+                f"(> {cfg.max_tree_upload_s:.0f}s) — host route too slow, refusing pod")
         for f in ("requirements-pod.txt", "provision_pod.sh"):
             rsync(endpoint, pdir / f, f"/workspace/provision/{f}", upload=True, ssh_key=cfg.ssh_key)
 
@@ -632,9 +832,9 @@ class CloudFleet:
                 if time.monotonic() - t > 1800:
                     proc.kill()
                     raise RunpodError(f"provisioning timed out after 30 min (see {plog})")
-                if self._stop.is_set():
+                if self._stop.is_set() or self._no_more_work.is_set():
                     proc.kill()
-                    raise RunpodError("provisioning aborted (fleet stopping)")
+                    raise RunpodError("provisioning aborted (fleet stopping or no work remains)")
                 time.sleep(5)
         tail = plog.read_text(encoding="utf-8", errors="replace")[-600:]
         if proc.returncode != 0 or "POD READY" not in tail:
@@ -643,7 +843,7 @@ class CloudFleet:
 
     # -------------------------------------------------------------- teardown
 
-    def _terminate(self, pod_id: str, name: str) -> None:
+    def _terminate(self, pod_id: str, name: str, ledger_id: int | None = None) -> None:
         """Delete a pod and record its fate HONESTLY.
 
         Only mark the ledger row 'terminated' (with terminated_at set, which is
@@ -656,30 +856,96 @@ class CloudFleet:
         worker's reconcile will confirm and finalise it. The old code marked
         every pod terminated even when DELETE threw, which could hide a pod that
         was still billing."""
-        self._ledger(name, state="terminating")
+        # The provider kill comes FIRST and the ledger writes are best-effort:
+        # a locked/unavailable SQLite must never stand between a billing pod
+        # and its termination (Codex finding #1 — the old order could leave a
+        # whole fleet billing during a DB outage with the cap already tripped).
+        def _ledger_soft(**fields):
+            try:
+                if ledger_id is not None:
+                    self._ledger_row(ledger_id, **fields)
+                else:
+                    # Resolve by pod_id (UNIQUE) — a name-based update could
+                    # terminally stamp several distinct attempts' rows at once
+                    # (Codex round-2 finding #6). Fall back to name only when
+                    # the pod has no row at all.
+                    with connect(self.settings.database_path) as db:
+                        cols = ", ".join(f"{k}=:{k}" for k in fields)
+                        cur = db.execute(
+                            f"UPDATE cloud_pods SET {cols} WHERE pod_id=:pid AND terminated_at IS NULL",
+                            {**fields, "pid": pod_id})
+                        if cur.rowcount == 0:
+                            self._ledger(name, **fields)
+            except Exception as exc:
+                self.log(f"[fleet] WARN ledger update failed for {name}: {str(exc)[:80]}")
+
+        _ledger_soft(state="terminating")
         try:
             self.client.terminate_pod(pod_id)  # True or raises
         except RunpodError as exc:
             self.log(f"[fleet] WARN terminate {pod_id} UNCONFIRMED ({exc}); "
                      f"left 'terminating' for the reaper — may still be billing")
-            self._ledger(name, error=f"terminate unconfirmed: {str(exc)[:300]}")
+            _ledger_soft(error=f"terminate unconfirmed: {str(exc)[:300]}")
             return
-        self._ledger(name, state="terminated", terminated_at=_now_iso())
+        _ledger_soft(state="terminated", terminated_at=_now_iso())
 
     def terminate_all(self) -> None:
         self._stop.set()
         with self._lock:
             slots = list(self._slots.values())
+        # PHASE 1 — provider kills only, no DB in the loop: a locked SQLite
+        # must never delay the NEXT pod's kill (Codex round-2 finding #5).
+        results: list[tuple["Slot", bool, str]] = []
         for slot in slots:
-            self._terminate(slot.pod_id, slot.name)
-        # Also sweep any ledger row for this job still creating/ready (a pod that
-        # was mid-bring-up when we stopped) plus any live pod the API knows is
-        # ours — belt and braces so nothing bills on.
+            try:
+                self.client.terminate_pod(slot.pod_id)
+                results.append((slot, True, ""))
+            except Exception as exc:
+                results.append((slot, False, str(exc)[:300]))
+                self.log(f"[fleet] WARN terminate {slot.pod_id} UNCONFIRMED: {str(exc)[:80]}")
+        # PHASE 2 — best-effort bookkeeping.
+        for slot, ok, err in results:
+            try:
+                if ok:
+                    self._ledger_row(slot.ledger_id, state="terminated", terminated_at=_now_iso()) \
+                        if slot.ledger_id else self._ledger(slot.name, state="terminated",
+                                                            terminated_at=_now_iso())
+                else:
+                    if slot.ledger_id:
+                        self._ledger_row(slot.ledger_id, state="terminating",
+                                         error=f"terminate unconfirmed: {err}")
+            except Exception as exc:
+                self.log(f"[fleet] WARN ledger update failed for {slot.name}: {str(exc)[:80]}")
+        # Sweep any live pod the API knows is ours (mid-bring-up strays), then
+        # sweep AGAIN after a grace period: a create POST that was in flight
+        # when we stopped can land after the first sweep (Codex finding #3).
+        for wait_s in (0.0, 10.0):
+            if wait_s:
+                time.sleep(wait_s)
+            try:
+                for pod in self.client.our_pods():
+                    if pod.get("name", "").startswith(f"{POD_NAME_PREFIX}{self.job['public_id']}-"):
+                        self._terminate(pod["id"], pod["name"])
+            except Exception:
+                pass
+        # Provider sweeps verified absence: close leftover pid-less
+        # 'unconfirmed' rows for this job so phantom creates stop accruing.
         try:
-            for pod in self.client.our_pods():
-                if pod.get("name", "").startswith(f"{POD_NAME_PREFIX}{self.job['public_id']}-"):
-                    self._terminate(pod["id"], pod["name"])
-        except RunpodError:
+            with connect(self.settings.database_path) as db:
+                db.execute(
+                    """UPDATE cloud_pods SET state='terminated', terminated_at=?
+                       WHERE job_id=? AND pod_id IS NULL AND state='terminating'
+                         AND error LIKE 'create unconfirmed%' AND terminated_at IS NULL""",
+                    (_now_iso(), self.job["id"]))
+        except Exception:
+            pass
+        # Per-job peer keypair is dead with its pods.
+        try:
+            if self._jobkey is not None:
+                priv, _ = self._jobkey
+                priv.unlink(missing_ok=True)
+                Path(f"{priv}.pub").unlink(missing_ok=True)
+        except Exception:
             pass
 
     def __enter__(self) -> "CloudFleet":

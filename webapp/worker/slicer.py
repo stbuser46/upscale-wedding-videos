@@ -88,7 +88,10 @@ def slice_unit(
             str(part),
         ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired as exc:
+        raise SliceError(f"ffmpeg/ffprobe timed out after 900s: {exc}") from exc
     if result.returncode != 0:
         part.unlink(missing_ok=True)
         raise SliceError(f"ffmpeg slice failed ({result.returncode}): {result.stderr.strip()[:400]}")
@@ -136,7 +139,10 @@ def slice_frame_hash(
         ]
     else:
         cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-f", "framemd5", "-"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired as exc:
+        raise SliceError(f"ffmpeg/ffprobe timed out after 900s: {exc}") from exc
     if result.returncode != 0:
         raise SliceError(f"framemd5 failed ({result.returncode}): {result.stderr.strip()[:200]}")
     tokens = [line.split()[-1] for line in result.stdout.splitlines()
@@ -172,7 +178,10 @@ def probe_frame_count(
             "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path),
         ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired as exc:
+        raise SliceError(f"ffmpeg/ffprobe timed out after 900s: {exc}") from exc
     if result.returncode != 0:
         raise SliceError(f"ffprobe failed ({result.returncode}): {result.stderr.strip()[:200]}")
     try:

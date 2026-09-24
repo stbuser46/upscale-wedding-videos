@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
@@ -527,8 +527,13 @@ def rsync(
     upload: bool,
     ssh_key: Path = DEFAULT_SSH_KEY,
     timeout: int | None = None,
+    bwlimit_kbps: int | None = None,
+    abort_check: "Callable[[], bool] | None" = None,
 ) -> None:
-    """Move one file to or from a pod, resumably."""
+    """Move one file to or from a pod, resumably. `bwlimit_kbps` caps the
+    transfer rate (KB/s) — used by bulk background transfers (the intermediate
+    staging) so they cannot starve latency-sensitive ones (first-wave slices).
+    `abort_check` is polled ~1 Hz; returning True kills the transfer."""
     host, port = endpoint
     shell = (
         f"ssh -p {port} -i {shlex.quote(str(ssh_key))} "
@@ -537,16 +542,39 @@ def rsync(
     )
     far = f"root@{host}:{remote}"
     pair = [str(local), far] if upload else [far, str(local)]
-    result = subprocess.run(
-        ["rsync", "-a", "--partial", "--inplace", "-e", shell, *pair],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
+    limit = [f"--bwlimit={bwlimit_kbps}"] if bwlimit_kbps else []
+    direction = "upload" if upload else "download"
+    # Popen + poll rather than a blocking run: a cancel/teardown must be able
+    # to interrupt a stuck multi-minute transfer instead of waiting out the
+    # full timeout (three 1800 s downloads could otherwise delay fleet
+    # teardown by hours).
+    proc = subprocess.Popen(
+        ["rsync", "-a", "--partial", "--inplace", *limit, "-e", shell, *pair],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    if result.returncode != 0:
-        direction = "upload" if upload else "download"
+    t0 = time.monotonic()
+    while proc.poll() is None:
+        if abort_check is not None and abort_check():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise RunpodError(f"rsync {direction} aborted")
+        if timeout is not None and time.monotonic() - t0 > timeout:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise RunpodError(f"rsync {direction} timed out after {timeout}s")
+        time.sleep(1.0)
+    if proc.returncode != 0:
+        stderr = (proc.stderr.read() if proc.stderr else "").strip()
         raise RunpodError(
-            f"rsync {direction} failed ({result.returncode}): {result.stderr.strip()[:400]}"
+            f"rsync {direction} failed ({proc.returncode}): {stderr[:400]}"
         )
 
 

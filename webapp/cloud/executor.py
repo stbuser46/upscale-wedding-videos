@@ -49,18 +49,34 @@ def upload_unit_slice(
     slice_path: Path,
     unit: dict,
     log_path: Path,
-    timeout: float = 1800,
+    timeout: float = 900,
+    should_abort: Callable[[], bool] = lambda: False,
 ) -> UnitResult:
     """Push one unit's slice to the pod. Safe to run while the pod's GPU is
     restoring a different unit (rsync-over-ssh does not touch the GPU)."""
     slice_path = Path(slice_path)
     _append_log(log_path, f"\n=== unit {unit['seq']} upload -> {endpoint[0]}:{endpoint[1]} ===\n")
     t0 = time.monotonic()
-    try:
-        rsync(endpoint, slice_path, f"{REMOTE_SLICES}/{slice_path.name}",
-              upload=True, ssh_key=ssh_key, timeout=timeout)
-    except Exception as exc:
-        return UnitResult(status=1, message=f"upload failed: {exc}")
+    # Retry like the download does: rsync is --partial/resumable, and a
+    # transient blip must not cost a fully-provisioned pod plus one of the
+    # unit's attempts (observed live 2026-09-24: one failed transfer retired
+    # a pod that had just spent 25 min provisioning).
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if should_abort():
+            return UnitResult(status=-1, message="aborted")
+        try:
+            rsync(endpoint, slice_path, f"{REMOTE_SLICES}/{slice_path.name}",
+                  upload=True, ssh_key=ssh_key, timeout=timeout, abort_check=should_abort)
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            _append_log(log_path,
+                        f"=== unit {unit['seq']} upload attempt {attempt + 1}/3 failed: {exc} ===\n")
+            time.sleep(3 * (attempt + 1))
+    if last_exc is not None:
+        return UnitResult(status=1, message=f"upload failed after 3 attempts: {last_exc}")
     return UnitResult(status=0, upload_s=time.monotonic() - t0)
 
 
@@ -102,6 +118,8 @@ def restore_unit(
     )
     cmd = ssh_command(endpoint, ["python", "/opt/SeedVR2/inference_cli.py", *argv], ssh_key)
 
+    import threading
+
     with log_path.open("a", encoding="utf-8", buffering=1) as log:
         log.write(f"\n=== unit {unit['seq']} restore on {endpoint[0]}:{endpoint[1]} "
                   f"skip={unit['skip']} cap={unit['cap']} prepend={unit['prepend']} "
@@ -109,9 +127,27 @@ def restore_unit(
         log.flush()
 
         t1 = time.monotonic()
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+        # Pipe stdout through a reader thread (instead of writing straight to
+        # the log) so silence is measurable: a healthy restore prints something
+        # at least every few minutes (batch lines ~80 s apart; the write phase
+        # is the quietest at ~1-3 min). A pod observed on 2026-09-24 wedged in
+        # a cold kernel compile for 40+ min with the GPU idle, billing until
+        # the 1-hour timeout — the stall guard catches that class in stall_s.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        last_line = [time.monotonic()]
+
+        def _pump():
+            for line in proc.stdout:
+                log.write(line)
+                last_line[0] = time.monotonic()
+            proc.stdout.close()
+
+        pump = threading.Thread(target=_pump, daemon=True, name="restore-pump")
+        pump.start()
         aborted = False
         timed_out = False
+        stalled = False
+        stall_s = 900.0
 
         def _kill():
             proc.terminate()
@@ -130,7 +166,12 @@ def restore_unit(
                 timed_out = True
                 _kill()
                 break
+            if time.monotonic() - last_line[0] > stall_s:
+                stalled = True
+                _kill()
+                break
             time.sleep(poll)
+        pump.join(timeout=10)
         t_run = time.monotonic() - t1
         if aborted:
             return UnitResult(status=-1, restore_s=t_run, message="aborted")
@@ -138,6 +179,11 @@ def restore_unit(
             log.write(f"=== unit {unit['seq']} TIMED OUT after {t_run:.0f}s (pod likely wedged) ===\n")
             return UnitResult(status=2, restore_s=t_run,
                               message=f"remote restore timed out after {t_run:.0f}s")
+        if stalled:
+            log.write(f"=== unit {unit['seq']} STALLED: no output for {stall_s:.0f}s "
+                      f"after {t_run:.0f}s (pod likely wedged) ===\n")
+            return UnitResult(status=2, restore_s=t_run,
+                              message=f"remote restore silent for {stall_s:.0f}s (wedged)")
         if proc.returncode != 0:
             return UnitResult(status=proc.returncode or 1, restore_s=t_run,
                               message=f"remote restore exited {proc.returncode}")
@@ -170,7 +216,8 @@ def download_unit(
         if should_abort():
             return UnitResult(status=-1, message="aborted")
         try:
-            rsync(endpoint, local_out, remote_out, upload=False, ssh_key=ssh_key, timeout=timeout)
+            rsync(endpoint, local_out, remote_out, upload=False, ssh_key=ssh_key,
+                  timeout=timeout, abort_check=should_abort)
             last_exc = None
             break
         except Exception as exc:

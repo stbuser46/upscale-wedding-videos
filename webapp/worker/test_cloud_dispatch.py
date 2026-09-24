@@ -105,6 +105,17 @@ class FakeFleet:
     def provisioning_done(self) -> bool:
         return self._provisioned
 
+    def request_replacement(self) -> None:
+        self.replacements_requested = getattr(self, "replacements_requested", 0) + 1
+
+    def relay_download(self, bad, *, remote_name, local_out, should_abort=lambda: False) -> bool:
+        self.relay_calls = getattr(self, "relay_calls", [])
+        self.relay_calls.append((bad, remote_name))
+        if getattr(self.cfg, "relay_works", False):
+            Path(local_out).write_bytes(b"relayed-unit")
+            return True
+        return False
+
     def start_intermediate_staging(self, local_path) -> None:
         self.staging_started.set()
 
@@ -156,7 +167,8 @@ class FakeExec:
                 return True
         return False
 
-    def upload_unit_slice(self, endpoint, ssh_key, *, slice_path, unit, log_path, timeout=1800):
+    def upload_unit_slice(self, endpoint, ssh_key, *, slice_path, unit, log_path,
+                          timeout=1800, should_abort=lambda: False, **kw):
         seq = unit["seq"]
         self._ev(f"up:{seq}:start", endpoint[0])
         time.sleep(TRANSFER_S)
@@ -260,7 +272,8 @@ class CloudDispatchTest(unittest.TestCase):
             (work / "input_50p_ffv1.mkv").write_bytes(b"ffv1")
             return 0
 
-        def fake_record_chunk(settings, job_id, unit, unit_path, state, frame_count=None):
+        def fake_record_chunk(settings, job_id, unit, unit_path, state,
+                              frame_count=None, checksum=None):
             with threading.Lock():
                 self.chunk_records.append((unit["seq"], state))
 
@@ -342,12 +355,31 @@ class CloudDispatchTest(unittest.TestCase):
         self.assertIn((2, "invalid"), self.chunk_records)
         self.assertIn((2, "valid"), self.chunk_records)
 
-    def test_download_failure_retries_and_marks_pod_suspect(self):
+    def test_download_failure_requeues_without_burning_an_attempt(self):
         self.fake_exec.fail_download = {1: 1}
         rc = self.run_dispatch()
         self.assertEqual(rc, 0)
-        self.assertIn((1, "invalid"), self.chunk_records)
+        # Transfer failures are a strike against the POD, not the unit: no
+        # 'invalid' attempt is recorded and the unit re-restores elsewhere.
+        self.assertNotIn((1, "invalid"), self.chunk_records)
         self.assertIn((1, "valid"), self.chunk_records)
+        starts = [e for e in self.events("restore:1:") if e[1].endswith(":start")]
+        self.assertEqual(len(starts), 2, "unit 1 must be re-restored after the lost download")
+
+    def test_relay_download_saves_a_finished_restore(self):
+        # A blocked home->pod route must not force a paid re-restore: the unit
+        # is pulled via a sibling pod instead (2026-09-24 incident class).
+        self.fake_exec.fail_download = {1: 9}   # direct download never works
+        base = self._with_cfg_extra(relay_works=True)
+        try:
+            rc = self.run_dispatch()
+        finally:
+            runner._cloud_fleet_config = base
+        self.assertEqual(rc, 0)
+        self.assertIn((1, "valid"), self.chunk_records)
+        starts = [e for e in self.events("restore:1:") if e[1].endswith(":start")]
+        self.assertEqual(len(starts), 1, "the relay must save the ORIGINAL restore")
+        self.assertTrue(FakeFleet.last.relay_calls)
 
     def test_attempt_cap_makes_a_poisoned_unit_terminal(self):
         self.fake_exec.fail_restore = {3: 99}
@@ -355,7 +387,7 @@ class CloudDispatchTest(unittest.TestCase):
             self.run_dispatch()
         self.assertIn("unit 3", str(ctx.exception))
         starts = [e for e in self.events("restore:3:") if e[1].endswith(":start")]
-        self.assertEqual(len(starts), 2, "attempt cap is 2 total attempts")
+        self.assertEqual(len(starts), 3, "attempt cap is 3 total attempts")
         self.assertFalse(self.assembled.is_set())
 
     def test_pause_stops_new_restores_but_finishes_in_flight(self):
@@ -440,8 +472,20 @@ class CloudDispatchTest(unittest.TestCase):
         self.assertIn("pod2", fleet.retired, "the late pod must be retired, not leaked")
         self.assertEqual(len(fleet.retired), 3, "every pod must end retired")
         self.assertTrue(fleet.slot_queue.empty())
-        # The late pod never did any work — it was retired on arrival.
-        self.assertFalse([e for e in self.fake_exec.events if e[2] == "10.0.0.2"])
+
+    def test_tail_unit_failure_is_retried_not_orphaned(self):
+        # Review finding A1: a unit failing in the run's FINAL wave (queue
+        # already empty) used to be requeued into a fleet whose runners had all
+        # retired — orphaned, failing the job at ~95%. The standby runner must
+        # pick it up.
+        last_seq = self.units[-1]["seq"]
+        self.fake_exec.fail_restore = {last_seq: 1}
+        rc = self.run_dispatch()
+        self.assertEqual(rc, 0)
+        starts = [e for e in self.events(f"restore:{last_seq}:") if e[1].endswith(":start")]
+        self.assertEqual(len(starts), 2, "the tail unit must be retried on another pod")
+        valid = sorted(seq for seq, state in self.chunk_records if state == "valid")
+        self.assertEqual(valid, [u["seq"] for u in self.units])
 
     def test_no_pods_at_all_fails_with_units_never_ran(self):
         patched = runner._cloud_fleet_config

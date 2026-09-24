@@ -246,6 +246,85 @@ dl dd { margin: 5px 0 0; overflow-wrap: anywhere; }
 .unit-chip.invalid { background: #f1dddd; color: #8c342e; }
 .unit-chip.pending { background: #ece6de; color: var(--muted); opacity: .6; }
 
+/* Live cloud pod telemetry (charts nested in the Cloud fleet panel) */
+.cloud-metrics-panel { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--line); }
+.cloud-metrics-header { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
+.cloud-metrics-header .eyebrow { margin: 0; }
+#cloud-metrics-note { font-size: 12px; }
+#cloud-metrics-note.stale { color: #a13a30; font-weight: 700; }
+.cloud-metrics-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+/* min-width: 0 overrides the grid item's default min-width: auto, which
+   otherwise lets an oversized child (e.g. a canvas briefly sized larger than
+   this cell's content box) force the whole 1fr track to grow to fit it. */
+.cloud-metric-cell { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; min-width: 0; }
+.cloud-metric-cell h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 750; }
+.cloud-metric-cell canvas { display: block; width: 100%; }
+.cloud-metrics-legend { display: flex; flex-wrap: wrap; gap: 14px 18px; margin-top: 16px; font-size: 12px; }
+.cloud-metrics-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.cloud-metrics-legend-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+@media (max-width: 900px) {
+  .cloud-metrics-grid { grid-template-columns: 1fr; }
+}
+
+/* Per-pod "right now" tile row — the honest, undiluted counterpart to the
+   fleet-average headline above it (see cloudNowTile / renderCloudMetricsTiles
+   in app.js): one card per live pod, GPU% as the big number, provisioning
+   pods called out by name rather than shown as a misleading 0%. */
+.cloud-now-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin: 4px 0 22px; }
+.cloud-now-card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.cloud-now-card.cloud-now-creating { border-style: dashed; }
+.cloud-now-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.cloud-now-head strong { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-weight: 700; }
+.cloud-now-gpu { font: 500 34px/1 Georgia, serif; font-variant-numeric: tabular-nums; }
+.cloud-now-gpu.muted { font-size: 16px; font-style: italic; text-transform: none; letter-spacing: normal; }
+.cloud-now-gpu.full { color: #2c7a4b; }
+
+/* Multi-disc/collection catalog grouping (library page) */
+.collection-group { margin-top: 46px; }
+.collection-group:first-child { margin-top: 0; }
+
+/* Live sub-progress (queue cards + job detail) — a source of movement between
+   the once-per-unit frames_done updates, tail-parsed from the job's own log. */
+.live-panel { margin: 0 0 28px; }
+.live-line { font-size: 15px; line-height: 1.5; margin: 6px 0 12px; }
+.live-bar { height: 8px; border-radius: 8px; overflow: hidden; background: #e8e1d8; }
+.live-bar-fill { height: 100%; width: 0; background: var(--gold); transition: width .4s ease; }
+#job-units, #job-live-updated { margin-top: 14px; }
+.queue-live { grid-column: 1 / -1; margin-top: 6px; padding-top: 16px; border-top: 1px dashed var(--line); display: flex; flex-direction: column; gap: 9px; }
+.queue-live-line { font-size: 13px; color: var(--ink); }
+.queue-live-units { display: flex; flex-wrap: wrap; gap: 4px; max-height: 64px; overflow-y: auto; }
+
+/* Job-level error panel */
+.job-error { background: #f5e4e1; border: 1px solid #d8aaa6; color: #8c342e; border-radius: 14px; padding: 16px 20px; margin: 0 0 28px; line-height: 1.5; }
+
+/* Local vs cloud identity — the two compute panels and each active queue
+   card carry an unmistakable badge + accent colour: green = this machine,
+   blue = rented RunPod pods. Colours reuse the existing ok/ready palettes. */
+.scope-badge, .exec-badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 750; font-family: Inter, ui-sans-serif, system-ui, sans-serif; text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
+.scope-badge { margin-left: 10px; vertical-align: 4px; }
+.exec-badge { margin-left: 7px; padding: 5px 9px; }
+.scope-badge.local, .exec-badge.local { background: #dfeadd; color: #2c7a4b; border: 1px solid #bcd8bd; }
+.scope-badge.cloud, .exec-badge.cloud { background: #e0e9f2; color: #2a5d78; border: 1px solid #c2d4e4; }
+.cloud-panel { border-top: 4px solid #2a5d78; }
+.metrics-panel { border-top: 4px solid #2c7a4b; }
+.pod-toolbar { margin: 0 0 18px; }
+#metrics-local-status { font-size: 13px; margin: 8px 0 0; }
+
+/* "Compute now" strip (top of queue page): the local machine + every live
+   pod in one glanceable row. Tiles reuse .cloud-now-card; the left accent
+   repeats the local/cloud colour code. */
+.resources-panel { margin: 0 0 34px; }
+.resources-panel .eyebrow { margin-bottom: 12px; }
+.resources-panel .cloud-now-grid { margin: 0; }
+.resources-panel .cloud-now-card { background: var(--card); }
+.resources-panel .loading { padding: 22px; }
+.cloud-now-card { border-left: 4px solid #c2d4e4; }
+.cloud-now-card.local-now-card { border-left-color: #9dc4aa; }
+.resource-job { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.provision-step { color: #8a6d3b; font-style: italic; }
+.pod-lifecycle { font-size: 11px; line-height: 1.45; }
+.cloud-state.idle { background: #ece6de; color: var(--muted); }
+
 /* Restoration previews (previews page) */
 .preview-set { margin-top: 40px; }
 .preview-set .section-heading { margin-bottom: 20px; }

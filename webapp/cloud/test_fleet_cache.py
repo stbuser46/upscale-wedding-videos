@@ -36,7 +36,7 @@ class FleetCacheSeedingTest(unittest.TestCase):
         self.ssh_calls: list[tuple] = []
         self.fail_scp = False
 
-        def fake_rsync(endpoint, local, remote, *, upload, ssh_key=None, timeout=None):
+        def fake_rsync(endpoint, local, remote, *, upload, ssh_key=None, timeout=None, **kw):
             with self.calls_lock:
                 self.rsync_calls.append((endpoint, str(local), remote, upload))
             if remote == "/opt/inductor_cache.tar":
@@ -134,7 +134,7 @@ class FleetIntermediateStoreTest(unittest.TestCase):
         self.hash_stdout = f"{self.GOOD_HASH}  -\n"
         self.fail_cut = False
 
-        def fake_rsync(endpoint, local, remote, *, upload, ssh_key=None, timeout=None):
+        def fake_rsync(endpoint, local, remote, *, upload, ssh_key=None, timeout=None, **kw):
             self.rsync_calls.append((endpoint, str(local), remote, upload))
 
         def fake_run_ssh(endpoint, command, *, ssh_key=None, check=True, capture=True, timeout=None):
@@ -221,7 +221,7 @@ class FleetIntermediateStoreTest(unittest.TestCase):
 
     def test_mark_no_more_work_drains_unclaimed_slots(self):
         terminated: list[str] = []
-        self.fleet._terminate = lambda pod_id, name: terminated.append(pod_id)
+        self.fleet._terminate = lambda pod_id, name, ledger_id=None: terminated.append(pod_id)
         for i in range(2):
             slot = fleet_mod.Slot(pod_id=f"idle{i}", name=f"wedding-intertest-{i}",
                                   endpoint=(f"10.2.0.{i}", 31000 + i), gpu_type="FAKE",

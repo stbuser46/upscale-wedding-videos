@@ -128,25 +128,35 @@ def _heartbeat(
     started: bool = False,
 ) -> None:
     def op() -> None:
+        # Local worker owns row 1 (as always); cloud workers own row 2 —
+        # concurrent workers previously clobbered one shared row, making the
+        # UI's worker pill and heartbeat-derived numbers ambiguous
+        # ("needs fixing.md" item 4). Row 2 is created on first use.
+        row_id = 2 if _cloud_enabled() else 1
         with connect(settings.database_path) as db:
             now = utc_now()
+            db.execute(
+                "INSERT INTO worker_status (id, pid, activity, last_beat_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                (row_id, os.getpid(), activity, now, now),
+            )
             if started:
                 db.execute(
                     "UPDATE worker_status SET pid=?, activity=?, active_job_id=?, detail=?, "
-                    "last_beat_at=?, started_at=?, updated_at=? WHERE id=1",
-                    (os.getpid(), activity, active_job_id, detail, now, now, now),
+                    "last_beat_at=?, started_at=?, updated_at=? WHERE id=?",
+                    (os.getpid(), activity, active_job_id, detail, now, now, now, row_id),
                 )
             elif error is not None:
                 db.execute(
                     "UPDATE worker_status SET pid=?, activity=?, active_job_id=?, detail=?, "
-                    "last_beat_at=?, last_error=?, last_error_at=?, updated_at=? WHERE id=1",
-                    (os.getpid(), activity, active_job_id, detail, now, error[:2000], now, now),
+                    "last_beat_at=?, last_error=?, last_error_at=?, updated_at=? WHERE id=?",
+                    (os.getpid(), activity, active_job_id, detail, now, error[:2000], now, now, row_id),
                 )
             else:
                 db.execute(
                     "UPDATE worker_status SET pid=?, activity=?, active_job_id=?, detail=?, "
-                    "last_beat_at=?, updated_at=? WHERE id=1",
-                    (os.getpid(), activity, active_job_id, detail, now, now),
+                    "last_beat_at=?, updated_at=? WHERE id=?",
+                    (os.getpid(), activity, active_job_id, detail, now, now, row_id),
                 )
     _best_effort(op)
 
@@ -461,6 +471,7 @@ def _run_pipeline(settings: Settings, job) -> int:
     started = time.monotonic()
     last_progress = 0.0
     last_metrics = 0.0
+    _eta_last_frames = [None]  # freeze the ETA countdown when no frames advance
     current_stage: str | None = "worker_checks"
     current_chunk = 1
     restore_started: float | None = None
@@ -538,9 +549,18 @@ def _run_pipeline(settings: Settings, job) -> int:
 
                 def _metrics_op(metrics=metrics):
                     with connect(settings.database_path) as db, transaction(db):
-                        current = db.execute("SELECT state, eta_seconds FROM jobs WHERE id=?", (job["id"],)).fetchone()
+                        current = db.execute(
+                            "SELECT state, eta_seconds, frames_done FROM jobs WHERE id=?",
+                            (job["id"],)).fetchone()
                         elapsed = time.monotonic() - started
-                        eta = max(0, (current["eta_seconds"] or 0) - 15) if current else None
+                        # Only count the ETA down while frames actually advance
+                        # — a stalled run's ETA must not keep shrinking
+                        # ("needs fixing.md" item 1c).
+                        if current and current["frames_done"] != _eta_last_frames[0]:
+                            _eta_last_frames[0] = current["frames_done"]
+                            eta = max(0, (current["eta_seconds"] or 0) - 15)
+                        else:
+                            eta = current["eta_seconds"] if current else None
                         db.execute(
                             "UPDATE jobs SET elapsed_seconds=?, eta_seconds=?, updated_at=? WHERE id=?",
                             (elapsed, eta, utc_now(), job["id"]),
@@ -725,7 +745,17 @@ def _plan_units(frames_total: int, chunk: int, overlap: int, ms_per_frame: float
     return units
 
 
-def _record_chunk(settings, job_id, unit, unit_path: Path, state: str, frame_count: int | None = None) -> None:
+def _file_sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _record_chunk(settings, job_id, unit, unit_path: Path, state: str,
+                  frame_count: int | None = None, checksum: str | None = None) -> None:
     relative = str(unit_path.resolve().relative_to(settings.data_dir))
 
     def op() -> None:
@@ -734,30 +764,35 @@ def _record_chunk(settings, job_id, unit, unit_path: Path, state: str, frame_cou
             db.execute(
                 """INSERT INTO job_chunks
                    (job_id, sequence, source_start_ms, source_end_ms, context_before_frames,
-                    warmup_frames, state, frame_count, artifact_path, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    warmup_frames, state, frame_count, checksum, artifact_path, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(job_id, sequence) DO UPDATE SET state=excluded.state,
-                     frame_count=excluded.frame_count, artifact_path=excluded.artifact_path,
+                     frame_count=excluded.frame_count, checksum=excluded.checksum,
+                     artifact_path=excluded.artifact_path,
                      updated_at=excluded.updated_at""",
                 (job_id, unit["seq"], unit["start_ms"], unit["end_ms"],
-                 unit["ctx"], unit["prepend"], state, frame_count, relative, now, now),
+                 unit["ctx"], unit["prepend"], state, frame_count, checksum, relative, now, now),
             )
     retry_db(op, attempts=5, base_delay=0.3)
 
 
 def _chunk_valid(settings: Settings, job_id: int, unit, unit_path: Path) -> bool:
     """Resume guard: a unit is reusable only if its row is 'valid', the file
-    exists, and its actual frame count matches — never trust the row alone."""
+    exists, its frame count matches, and — when a checksum was recorded — the
+    file's bytes still hash to it (a right-length wrong-content file must not
+    survive resume; Codex finding #11)."""
     if not unit_path.is_file() or unit_path.stat().st_size == 0:
         return False
     with connect(settings.database_path) as db:
         row = db.execute(
-            "SELECT state, frame_count FROM job_chunks WHERE job_id=? AND sequence=?",
+            "SELECT state, frame_count, checksum FROM job_chunks WHERE job_id=? AND sequence=?",
             (job_id, unit["seq"]),
         ).fetchone()
     if not row or row["state"] != "valid" or row["frame_count"] != unit["new"]:
         return False
     try:
+        if row["checksum"] and _file_sha256(unit_path) != row["checksum"]:
+            return False
         return _probe_frame_count(settings, unit_path) == unit["new"]
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
@@ -839,16 +874,23 @@ def _units_frames_done(settings: Settings, job_id: int) -> int | None:
     return total
 
 
-def _unit_progress(settings: Settings, job, frames_done: int, run_started: float, frames_at_start: int) -> None:
+def _unit_progress(settings: Settings, job, frames_done: int, run_started: float,
+                   frames_at_start: int, *, parallelism: int = 1,
+                   fps_recent: float | None = None) -> None:
     """Refresh fps/elapsed/ETA from durable-unit throughput. The line-parsing
     progress updates in _run_pipeline only serve the legacy monolithic path,
-    so without this a durable job shows "ETA pending" for its whole run. Uses
-    the 0.71 fps planning rate until the first unit of this run completes."""
+    so without this a durable job shows "ETA pending" for its whole run.
+
+    `parallelism` scales the 0.71 fps single-GPU planning fallback for cloud
+    fleets (an 7-pod fleet was showing a ~4x-too-long cold-start ETA), and
+    `fps_recent` (windowed throughput over recent completions) beats the
+    run-average, which bakes every past stall into the rest of the run."""
     elapsed = time.monotonic() - run_started
     produced = frames_done - frames_at_start
-    fps = produced / elapsed if produced > 0 and elapsed > 0 else None
+    fps_avg = produced / elapsed if produced > 0 and elapsed > 0 else None
+    fps = fps_recent or fps_avg
     remaining = max(0, job["frames_total"] - frames_done)
-    eta = remaining / fps if fps else remaining / 0.71
+    eta = remaining / fps if fps else remaining / (0.71 * max(1, parallelism))
 
     def op() -> None:
         with connect(settings.database_path) as db, transaction(db):
@@ -1028,7 +1070,8 @@ def _run_units(settings: Settings, job) -> int:
             else:
                 _record_chunk(settings, job["id"], unit, unit_path, "invalid")
                 raise WorkerError(f"Unit {unit['seq']} produced {actual} frames, expected {unit['new']}")
-        _record_chunk(settings, job["id"], unit, unit_path, "valid", frame_count=actual)
+        _record_chunk(settings, job["id"], unit, unit_path, "valid", frame_count=actual,
+                      checksum=_file_sha256(unit_path))
         done = _units_frames_done(settings, job["id"])
         if done is not None and run_started is not None:
             _unit_progress(settings, job, done, run_started, frames_at_start)
@@ -1081,12 +1124,37 @@ def _reconcile_cloud_pods(settings: Settings) -> None:
     job. The old code marked every row terminated unconditionally, which could
     hide a pod that was still billing."""
     try:
-        from webapp.cloud.runpod_api import RunpodClient, RunpodError
+        from webapp.cloud.runpod_api import RunpodClient, RunpodError, POD_NAME_PREFIX
         client = RunpodClient()
         live_before = {p["id"]: p for p in client.our_pods()}
+
+        def _owned_by_live_worker(pod: dict) -> bool:
+            """A pod belonging to a job with a FRESH lease is another cloud
+            worker's live fleet — terminating it would murder that run (this
+            is what makes concurrent cloud workers safe; the old reconcile
+            killed every project pod unconditionally)."""
+            name = pod.get("name", "")
+            if not name.startswith(POD_NAME_PREFIX):
+                return False
+            public_id = name[len(POD_NAME_PREFIX):].rsplit("-", 1)[0]
+            with connect(settings.database_path) as db:
+                row = db.execute(
+                    "SELECT state, lease_expires_at FROM jobs WHERE public_id=?",
+                    (public_id,),
+                ).fetchone()
+            if not row or row["state"] not in ("preparing", "worker_checks", "running",
+                                               "assembling", "pause_requested", "cancel_requested"):
+                return False
+            lease = row["lease_expires_at"]
+            return bool(lease) and lease > utc_now()
+
         confirmed_gone: set[str] = set()
         still_live: set[str] = set()
-        for pod_id in live_before:
+        for pod_id, pod in live_before.items():
+            if _owned_by_live_worker(pod):
+                still_live.add(pod_id)
+                print(f"reconcile: pod {pod_id} belongs to a live-leased job; leaving it", flush=True)
+                continue
             try:
                 client.terminate_pod(pod_id)  # True or raises
                 confirmed_gone.add(pod_id)
@@ -1099,10 +1167,19 @@ def _reconcile_cloud_pods(settings: Settings) -> None:
         now = utc_now()
         with connect(settings.database_path) as db, transaction(db):
             rows = db.execute(
-                "SELECT id, pod_id FROM cloud_pods WHERE terminated_at IS NULL"
+                """SELECT c.id, c.pod_id, j.state AS job_state, j.lease_expires_at
+                   FROM cloud_pods c LEFT JOIN jobs j ON j.id = c.job_id
+                   WHERE c.terminated_at IS NULL"""
             ).fetchall()
             for row in rows:
                 pid = row["pod_id"]
+                # Never finalize a row belonging to a live-leased job: a
+                # pid-less row may be a concurrent worker's create-in-flight
+                # (Codex round-2 finding #3).
+                if (row["job_state"] in ("preparing", "worker_checks", "running",
+                                         "assembling", "pause_requested", "cancel_requested")
+                        and row["lease_expires_at"] and row["lease_expires_at"] > now):
+                    continue
                 if pid is None or pid in confirmed_gone or pid not in live_before:
                     # No pod id, just killed, or provider never listed it -> gone.
                     db.execute(
@@ -1175,6 +1252,7 @@ def _cloud_fleet_config(settings: Settings):
         cloud_type=os.environ.get("WEDDING_CLOUD_TIER", "SECURE"),
         max_slots=int(os.environ.get("WEDDING_CLOUD_MAX_SLOTS", "16")),
         spend_cap_usd=float(os.environ.get("WEDDING_CLOUD_SPEND_CAP_USD", "250")),
+        max_tree_upload_s=float(os.environ.get("WEDDING_CLOUD_MAX_TREE_S", "60")),
         provision_dir=provision_dir,
         inductor_cache=cache if cache.is_dir() else None,
     )
@@ -1266,9 +1344,22 @@ def _run_units_cloud(settings: Settings, job) -> int:
         # waits on the home link). A pod failure requeues its units for another
         # pod, bounded by MAX_UNIT_ATTEMPTS so a poisoned unit cannot loop
         # forever on fresh pods.
-        MAX_UNIT_ATTEMPTS = 2
+        MAX_UNIT_ATTEMPTS = 3
         state_lock = _threading.Lock()
         queue = deque(pending)
+        # Units popped from the queue that have not yet been SETTLED (requeued,
+        # completed, or terminally failed). Settlement is IDEMPOTENT — every
+        # resolution path first claims the unit out of open_units under the
+        # lock, so double-resolution (e.g. a finalize crash after commit) and
+        # missed resolution (an unexpected exception) can neither corrupt the
+        # count nor deadlock the standby runner (Codex round-2 finding #1).
+        open_units: dict[int, dict] = {}
+        # At most ONE idle pod is held back as standby for such requeues; the
+        # rest retire as before so the tail doesn't idle-bill a whole fleet.
+        standby = _threading.Semaphore(1)
+        # Set by the dispatch block: spawns an extra pod_runner thread so
+        # replacement/hot-added pods always have a runner to claim them.
+        runner_spawn: list = [None]
         attempts: dict[int, int] = {}
         completed: set[int] = set()
         errors: list[str] = []
@@ -1277,11 +1368,32 @@ def _run_units_cloud(settings: Settings, job) -> int:
         # Per-slice framemd5 digest: lets a pod receive its slice from the seed
         # pod (datacenter-side) after PROVING it identical to the local cut.
         slice_hashes: dict[int, str] = {}
+        # (monotonic_time, frames) per validated unit — windowed throughput
+        # for honest ETAs ("needs fixing.md" item 1).
+        completion_log: list[tuple[float, int]] = []
+
+        def _recent_fps(window_s: float = 2400.0):
+            cutoff = time.monotonic() - window_s
+            with state_lock:
+                pts = [(t, f) for t, f in completion_log if t >= cutoff]
+            if not pts:
+                return None
+            span = time.monotonic() - min(t for t, _ in pts)
+            frames = sum(f for _, f in pts)
+            return frames / span if span > 120 and frames else None
         # Bound how far slicing runs ahead of the pods (~220 MB per slice on
         # disk); a slot is released when its unit reaches a terminal state.
         slice_budget = _threading.Semaphore(max(4, 2 * n_slots))
         dispatch_done = _threading.Event()
         tail_seq = units[-1]["seq"]
+        # Persisted slice hashes: a resume re-uses slices already on disk
+        # (cut+hashed before the pause/failure) instead of re-decoding each
+        # one, taking ~10+ min off a fresh fleet's ramp-up.
+        hash_cache_path = slices_dir / "hashes.json"
+        try:
+            hash_cache = json.loads(hash_cache_path.read_text())
+        except Exception:
+            hash_cache = {}
 
         def fatal_stop() -> bool:
             return stop_reason() is not None or fleet.capped
@@ -1294,18 +1406,38 @@ def _run_units_cloud(settings: Settings, job) -> int:
             with state_lock:
                 if stop_reason() is not None or fleet.capped:
                     return None
-                return queue.popleft() if queue else None
+                if not queue:
+                    return None
+                unit = queue.popleft()
+                open_units[unit["seq"]] = unit
+                return unit
+
+        def _settle(unit) -> bool:
+            """Claim the right to resolve this popped unit. Exactly one caller
+            wins; everyone else becomes a no-op."""
+            with state_lock:
+                return open_units.pop(unit["seq"], None) is not None
+
+        def drained() -> bool:
+            """No unit left to run AND none open that could still requeue."""
+            with state_lock:
+                return not queue and not open_units
 
         def requeue_quietly(unit) -> None:
             """Put back a unit that was popped but never attempted (pause hit,
-            or its pod went suspect before it started) — no attempt charged."""
+            or its pod went suspect before it started) — no attempt charged.
+            Idempotent: a second resolution of the same unit is a no-op."""
+            if not _settle(unit):
+                return
             with state_lock:
                 queue.appendleft(unit)
 
         def unit_failed(unit, why: str) -> None:
             """An attempted unit failed: requeue it for another pod, or record
             a terminal error once its attempts are spent. The slice file is
-            kept while a retry is still possible."""
+            kept while a retry is still possible. Idempotent via _settle."""
+            if not _settle(unit):
+                return
             seq = unit["seq"]
             _record_chunk(settings, job["id"], unit, units_dir / f"unit_{seq:05d}.mkv", "invalid")
             with state_lock:
@@ -1334,6 +1466,13 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     continue
                 spath = slices_dir / f"unit_{seq:05d}.mkv"
                 try:
+                    cached = hash_cache.get(str(seq))
+                    st = spath.stat() if spath.is_file() else None
+                    if (cached and st and st.st_size == cached.get("size")
+                            and int(st.st_mtime) == cached.get("mtime")):
+                        slice_hashes[seq] = cached["hash"]  # resume: reuse as-is
+                        slice_ready[seq].set()
+                        continue
                     slice_unit(stage1, unit["skip"], unit["cap"], spath,
                                fps=_output_fps(snapshot),
                                ffmpeg_image=settings.ffmpeg_image, data_dir=settings.data_dir,
@@ -1342,9 +1481,18 @@ def _run_units_cloud(settings: Settings, job) -> int:
                         slice_hashes[seq] = slice_frame_hash(
                             spath, ffmpeg_image=settings.ffmpeg_image,
                             data_dir=settings.data_dir)
+                        st = spath.stat()
+                        hash_cache[str(seq)] = {"size": st.st_size,
+                                                "mtime": int(st.st_mtime),
+                                                "hash": slice_hashes[seq]}
+                        hash_cache_path.write_text(json.dumps(hash_cache))
                     except Exception:
                         pass  # no hash -> this unit just skips the peer path
-                except SliceError as exc:
+                except Exception as exc:
+                    # Catch EVERYTHING, not just SliceError: an OSError from the
+                    # docker invocation would otherwise kill this thread and
+                    # leave every later unit's event unset — runners would wait
+                    # forever while pods idle-bill (review finding A3).
                     with state_lock:
                         slice_error[seq] = str(exc)
                         try:
@@ -1368,14 +1516,16 @@ def _run_units_cloud(settings: Settings, job) -> int:
                         requeue_quietly(unit)
                         return None
                 with state_lock:
-                    if seq in slice_error:
-                        continue  # slicer already recorded the failure; next unit
+                    dropped = seq in slice_error
+                if dropped:
+                    _settle(unit)
+                    continue  # slicer already recorded the failure; next unit
                 if fatal_stop():
                     requeue_quietly(unit)
                     return None
                 return unit
 
-        def finalize_unit(slot, unit, pod_bad) -> None:
+        def finalize_unit(slot, unit, on_transfer_strike) -> None:
             """Download + validate one restored unit. Runs in a helper thread so
             the pod can start restoring its next (already uploaded) unit
             immediately instead of idling through the pull."""
@@ -1389,9 +1539,22 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 if res.status == -1:  # aborted (stop requested)
                     return
                 if res.status != 0:
-                    pod_bad.set()  # its network is suspect; stop feeding it
-                    unit_failed(unit, f"download failed from pod {slot.pod_id}: {res.message}")
-                    return
+                    # The unit IS restored (paid for) on the pod — before
+                    # giving up on retrieving it, try pulling it via a sibling
+                    # pod (a home->pod route block must not burn the restore).
+                    if fleet.relay_download(slot.endpoint,
+                                            remote_name=f"unit_{seq:05d}.mkv",
+                                            local_out=upath,
+                                            should_abort=lambda: hard_stop() is not None):
+                        on_transfer_strike()  # the direct route is still suspect
+                        res = cloud_exec.UnitResult(status=0)
+                    else:
+                        # Transfer, not GPU, failure: strike the pod (two
+                        # condemn it) and requeue without burning one of the
+                        # unit's attempts.
+                        on_transfer_strike()
+                        requeue_quietly(unit)
+                        return
                 actual = _probe_frame_count(settings, upath)
                 local_unit = unit
                 if actual != unit["new"]:
@@ -1402,9 +1565,13 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     else:
                         unit_failed(unit, f"produced {actual} frames, expected {unit['new']}")
                         return
-                _record_chunk(settings, job["id"], local_unit, upath, "valid", frame_count=actual)
+                if not _settle(unit):
+                    return  # another path already resolved this unit
+                _record_chunk(settings, job["id"], local_unit, upath, "valid",
+                              frame_count=actual, checksum=_file_sha256(upath))
                 with state_lock:
                     completed.add(seq)
+                    completion_log.append((time.monotonic(), actual))
                 spath.unlink(missing_ok=True)
                 slice_budget.release()
                 # Completing a unit is proof the pod is alive: refresh its TTL
@@ -1413,7 +1580,9 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 slot.created_at = time.monotonic()
                 done = _units_frames_done(settings, job["id"])
                 if done is not None:
-                    _unit_progress(settings, job, done, run_started, frames_at_start)
+                    _unit_progress(settings, job, done, run_started, frames_at_start,
+                                   parallelism=max(1, fleet.ready),
+                                   fps_recent=_recent_fps())
             except Exception as exc:  # never lose a unit to a validator crash
                 unit_failed(unit, f"validation failed: {exc}")
 
@@ -1433,7 +1602,8 @@ def _run_units_cloud(settings: Settings, job) -> int:
             return cloud_exec.upload_unit_slice(
                 slot.endpoint, cfg.ssh_key,
                 slice_path=slices_dir / f"unit_{seq:05d}.mkv",
-                unit=unit, log_path=log)
+                unit=unit, log_path=log,
+                should_abort=lambda: hard_stop() is not None)
 
         def pod_runner(idx: int) -> None:
             """Own one pod for its whole life. A pod that fails or times out a
@@ -1442,33 +1612,73 @@ def _run_units_cloud(settings: Settings, job) -> int:
             next unit too, while billing). Retires the pod the moment there is
             no more work for it."""
             slot = fleet.acquire_slot(
-                stop_check=lambda: fatal_stop() or not queue_has_work())
+                stop_check=lambda: fatal_stop() or drained())
             if slot is None:
-                # Queue drained with no pod acquired: make sure no unclaimed or
+                # Drained with no pod acquired: make sure no unclaimed or
                 # late-arriving pod is left billing with nobody to retire it.
-                if not fatal_stop() and not queue_has_work():
+                if not fatal_stop() and drained():
                     fleet.mark_no_more_work()
                 return
+            # A freshly-claimed pod is alive by definition: restart its TTL
+            # clock so time spent queued (e.g. during a long stage-1 prepare)
+            # can't get a healthy pod killed mid-first-unit (finding A2).
+            slot.created_at = time.monotonic()
             pod_bad = _threading.Event()
+            # Transfer failures get TWO strikes before the pod is condemned:
+            # one blip is as likely the home link or a rate-limited route as
+            # the pod (three pods were retired for exactly this on
+            # 2026-09-24). GPU-side restore failures still condemn instantly.
+            transfer_strikes = [0]
+
+            def transfer_strike() -> None:
+                transfer_strikes[0] += 1
+                if transfer_strikes[0] >= 2:
+                    pod_bad.set()
+
             finalizers: list[_threading.Thread] = []
             try:
-                current = next_ready_unit()
-                if current is not None:
-                    up = deliver_slice(slot, current)
-                    if up.status != 0:
-                        unit_failed(current, up.message)
-                        pod_bad.set()
-                        current = None
-                while current is not None:
+                current = None
+                while True:
                     reason = stop_reason()
                     if reason is not None or fleet.capped:
-                        if reason == "pause":
+                        if reason == "pause" and current is not None:
                             requeue_quietly(current)  # popped but never started
                         break
                     if pod_bad.is_set():
-                        requeue_quietly(current)  # pod is suspect; run it elsewhere
+                        if current is not None:
+                            requeue_quietly(current)  # pod suspect; run elsewhere
                         break
+                    if current is None:
+                        if drained():
+                            break
+                        if not queue_has_work():
+                            # Units are in flight on other pods and one may yet
+                            # requeue. Hold AT MOST ONE pod as standby for that
+                            # case; the rest retire so the tail doesn't
+                            # idle-bill a whole fleet (finding A1).
+                            if not standby.acquire(blocking=False):
+                                break
+                            try:
+                                while (not queue_has_work() and not drained()
+                                       and stop_reason() is None and not fleet.capped
+                                       and not pod_bad.is_set()):
+                                    time.sleep(2.0)
+                            finally:
+                                standby.release()
+                            continue
+                        current = next_ready_unit()
+                        if current is None:
+                            continue
+                        up = deliver_slice(slot, current)
+                        if up.status != 0:
+                            requeue_quietly(current)  # never ran: no attempt burned
+                            transfer_strike()
+                            current = None
+                        continue
                     seq = current["seq"]
+                    # Starting GPU work is proof of life: refresh the TTL clock
+                    # so the watchdog never kills a healthy mid-restore pod.
+                    slot.created_at = time.monotonic()
                     _record_chunk(settings, job["id"], current,
                                   units_dir / f"unit_{seq:05d}.mkv", "running")
                     _heartbeat(settings, "running", active_job_id=job["id"],
@@ -1496,10 +1706,10 @@ def _run_units_cloud(settings: Settings, job) -> int:
                             box["unit"] = unit
                         else:
                             # Never abort a paid in-flight restore over a
-                            # prefetch blip: send the unit to another pod and
-                            # stop feeding this one.
-                            unit_failed(unit, res.message)
-                            bad.set()
+                            # prefetch blip: requeue (no attempt burned — the
+                            # unit never ran) and strike the pod.
+                            requeue_quietly(unit)
+                            transfer_strike()
 
                     pre = _threading.Thread(target=prefetch, daemon=True,
                                             name=f"prefetch-{idx}")
@@ -1524,19 +1734,32 @@ def _run_units_cloud(settings: Settings, job) -> int:
                         break
                     # Restore done: hand download/validation to a helper so the
                     # next (already uploaded) unit starts on the GPU right away.
-                    fin = _threading.Thread(target=finalize_unit, args=(slot, current, pod_bad),
+                    fin = _threading.Thread(target=finalize_unit,
+                                            args=(slot, current, transfer_strike),
                                             daemon=True, name=f"finalize-{idx}")
                     fin.start()
                     finalizers.append(fin)
                     current = nxt
             finally:
+                # Idempotent safety net: whatever exited this loop — including
+                # an unexpected exception mid-body — the popped unit must not
+                # stay open forever (Codex round-2 finding #1). If it was
+                # already resolved, this is a no-op.
+                if current is not None:
+                    requeue_quietly(current)
                 # The pod must outlive its in-flight downloads.
                 for t in finalizers:
                     t.join()
                 if hard_stop() is None and not fleet.capped:
                     # No more work / pause / pod suspect: stop billing now.
                     fleet.retire_slot(slot)
-                    if stop_reason() is None and not queue_has_work():
+                    if pod_bad.is_set() and stop_reason() is None and queue_has_work():
+                        # A WORKING pod died with units still queued: recover
+                        # capacity instead of letting the fleet only shrink.
+                        fleet.request_replacement()
+                        if runner_spawn[0] is not None:
+                            runner_spawn[0]()
+                    if stop_reason() is None and drained():
                         # This may be the last working pod: sweep any sibling
                         # still provisioning or queued so it can't bill idle.
                         fleet.mark_no_more_work()
@@ -1544,11 +1767,27 @@ def _run_units_cloud(settings: Settings, job) -> int:
 
         beat_stop = _threading.Event()
 
+        add_pods_path = work / "add_pods"
+
         def beater() -> None:
-            """Refresh the heartbeat during multi-minute remote restores, so the
-            UI never declares the worker down mid-unit."""
+            """Refresh the heartbeat during multi-minute remote restores, and
+            poll the hot-add control file: `echo N > <work>/add_pods` grows the
+            fleet by N pods mid-run (bounded by the replacement budget and the
+            spend cap; pods still provision the normal guarded way)."""
             base_done = len(units) - len(pending)
             while not beat_stop.wait(20.0):
+                try:
+                    if add_pods_path.is_file():
+                        n = int(add_pods_path.read_text().strip() or "0")
+                        add_pods_path.unlink()
+                        for _ in range(max(0, min(n, 16))):
+                            fleet.request_replacement()
+                            if runner_spawn[0] is not None:
+                                runner_spawn[0]()
+                        if n > 0:
+                            print(f"[dispatch] hot-add: {n} extra pod(s) requested", flush=True)
+                except Exception:
+                    pass
                 with state_lock:
                     ndone = base_done + len(completed)
                 _best_effort(lambda: _heartbeat(
@@ -1578,13 +1817,33 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 beat_thread = _threading.Thread(target=beater, daemon=True, name="cloud-beat")
                 beat_thread.start()
                 try:
-                    with ThreadPoolExecutor(max_workers=n_slots) as ex:
+                    # Headroom above n_slots so replacement and hot-added pods
+                    # get runner threads too (a queued pod with no runner would
+                    # bill unclaimed). Runners are cheap; pods are not.
+                    with ThreadPoolExecutor(max_workers=max(32, n_slots * 2)) as ex:
                         futures = [ex.submit(pod_runner, i) for i in range(n_slots)]
-                        for fut in as_completed(futures):
-                            exc = fut.exception()
-                            if exc is not None:
-                                with state_lock:
-                                    errors.append(str(exc))
+
+                        def spawn_runner() -> None:
+                            with state_lock:
+                                futures.append(ex.submit(pod_runner, len(futures)))
+
+                        runner_spawn[0] = spawn_runner
+                        # Wait for ALL runners, including ones spawned mid-run
+                        # by replacement/hot-add (a fixed as_completed set
+                        # would return while late runners still worked).
+                        seen = 0
+                        while True:
+                            with state_lock:
+                                snap = list(futures)
+                            for fut in snap[seen:]:
+                                exc = fut.exception()
+                                if exc is not None:
+                                    with state_lock:
+                                        errors.append(str(exc))
+                            seen = len(snap)
+                            with state_lock:
+                                if len(futures) == seen:
+                                    break
                 finally:
                     dispatch_done.set()
                     beat_stop.set()
@@ -1612,7 +1871,9 @@ def _run_units_cloud(settings: Settings, job) -> int:
             if queue:
                 errors.append(f"{len(queue)} unit(s) never ran (no cloud GPU available for them)")
         if errors:
-            raise WorkerError(f"{len(errors)} unit(s) failed: {errors[0]}")
+            raise WorkerError(
+                f"{len(errors)} unit(s) failed: {errors[0]} — finished units are "
+                f"saved; press Resume to continue from them on a fresh fleet.")
 
     # All units valid → assemble locally (lossless concat + FLAC mux).
     reason = stop_reason()
@@ -1718,7 +1979,15 @@ def main(argv: list[str] | None = None) -> None:
     # separate cloud-worker.lock. That lets a local and a cloud worker run side by
     # side against the same queue — job claiming is already atomic (_claim_next),
     # so they never grab the same segment.
-    lock_name = "cloud-worker.lock" if _cloud_enabled() else "gpu.lock"
+    # WEDDING_CLOUD_MULTI=1 allows several cloud workers side by side (one per
+    # job). Safe ONLY because reconcile is now lease-aware: a second worker's
+    # startup no longer terminates a live-leased job's pods.
+    if _cloud_enabled() and os.environ.get("WEDDING_CLOUD_MULTI") == "1":
+        lock_name = f"cloud-worker-{os.getpid()}.lock"
+    elif _cloud_enabled():
+        lock_name = "cloud-worker.lock"
+    else:
+        lock_name = "gpu.lock"
     with GpuLock(settings.data_dir / "worker" / lock_name):
         _heartbeat(settings, "idle", started=True)
         try:

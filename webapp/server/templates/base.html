@@ -4,15 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{ session.csrf_token }}">
-  <title>{% block title %}Wedding Film Restoration{% endblock %}</title>
+  <title>{% block title %}Video Restoration{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body data-page="{{ page|default('') }}" {% block body_data %}{% endblock %}>
   <header class="site-header">
     <a class="brand" href="{{ url_for('library') }}">
-      <span class="brand-mark">YA</span>
-      <span><strong>Yacoob &amp; Aysha</strong><small>Film restoration archive</small></span>
+      <span class="brand-mark">VR</span>
+      <span><strong>Video Restoration</strong><small>Film restoration archive</small></span>
     </a>
     <nav>
       <a href="{{ url_for('library') }}" {% if page == 'library' %}aria-current="page"{% endif %}>Library</a>

@@ -232,6 +232,13 @@ Tuning:
 | `WEDDING_CLOUD_SPEND_CAP_USD` | `250` | Hard ceiling on the job's accrued pod spend: a watchdog tears the whole fleet down the moment it is reached (also checked before each bring-up). Keep it below your RunPod balance. |
 | `WEDDING_CLOUD_TIER` | `SECURE` | RunPod cloud tier. |
 | `WEDDING_CLOUD_GPU_PREFERENCE` | — | Preferred `gpuTypeId`s, in order. |
+| `WEDDING_CLOUD_MAX_TREE_S` | `60` | Ingress gate: a host that can't take the 6 MB code tree in this many seconds is refused before provisioning. |
+| `WEDDING_CLOUD_MULTI` | unset | Set `1` to allow a second concurrent cloud worker (lease-aware reconcile makes this safe; default remains one fleet at a time). |
+
+**Growing a running fleet (hot-add):** while a cloud job runs,
+`echo N > webapp/data/restoration_work/<job_public_id>/add_pods` brings up N
+extra pods (bounded by the replacement budget and the spend cap). Pods that
+die mid-run with units still queued are replaced automatically.
 
 The queue page shows a read-only **Cloud fleet** panel (live pods, uptime, and
 running spend) while cloud jobs run; it stays hidden for local-only operation.

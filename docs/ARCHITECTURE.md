@@ -178,11 +178,55 @@ instead of billing them through transfers:
   bring-ups are abandoned. Found live 2026-09-23: a slow-provisioning pod went
   READY after the queue emptied and billed idle until the spend cap tripped.
 - **In-run retry:** a unit that fails on a pod is requeued for another pod
-  (bounded at 2 total attempts) and the suspect pod is retired, instead of
+  (bounded at 3 total attempts) and the suspect pod is retired, instead of
   failing the whole run and re-provisioning a fresh fleet via auto-resume.
   Pause/cancel/cap semantics are unchanged and covered, with the rest of the
   dispatch logic, by the no-network mock suite
   `webapp/worker/test_cloud_dispatch.py`.
+
+**Hardening round 2 (2026-09-24).** Two paid fleet days (segments 14/16 era)
+plus two adversarial reviews (fresh-context agent + external Codex at max
+effort, twice) drove a second fix wave — each item traces to a live incident
+or a confirmed review finding:
+
+- **Settle-once dispatch:** every popped unit lives in `open_units` until
+  exactly one resolution path claims it (idempotent `_settle`); an unexpected
+  exception anywhere can no longer leak a unit and deadlock the fleet, and the
+  runner's `finally` requeues anything left open.
+- **Failure containment:** transfer failures strike a pod twice before
+  condemning it (one blip is as likely the route as the pod); a finished unit
+  whose download fails is pulled **via a sibling pod** (`relay_download`)
+  before any re-restore; restores are killed as wedged after 15 min of output
+  silence (a pod once spun a cold kernel compile for 40 min at 0% GPU).
+- **Capacity recovery:** a working pod that dies with units queued triggers an
+  automatic **replacement** bring-up, and the operator can **hot-add** pods
+  mid-run (`echo N > <work>/add_pods`) — both spawn matching runner threads.
+- **Host quality control:** the 6 MB tree upload doubles as an **ingress
+  gate** (serialized probes; a host slower than `WEDDING_CLOUD_MAX_TREE_S`
+  ~60 s is refused before provisioning — one bad-route host was adopted four
+  times in one day before this existed) and seeds per-pod ingress hints for
+  intermediate-seed selection.
+- **Money accounting:** one ledger row per PHYSICAL create attempt (addressed
+  by primary key — name-keyed rows could hide an unconfirmed dud's spend);
+  ambiguous creates stay open as `terminating`/"create unconfirmed" until
+  provider sweeps verify absence; unpriceable pods are refused (a 0 $/h rate
+  blinds the watchdog); the spend watchdog **fails closed** (3 failed spend
+  queries → teardown); teardown kills all pods provider-side FIRST and does
+  ledger bookkeeping after, with a delayed second sweep for in-flight creates.
+- **Interruptibility:** rsync transfers poll an abort callback ~1 Hz, so
+  cancel/teardown no longer waits out multi-hundred-second timeouts.
+- **Resume integrity:** valid units record a sha256 and resume re-verifies it
+  (frame-count alone accepted a right-length wrong-content file); slice
+  hashes persist (`slices/hashes.json`) so a resume skips re-cutting and
+  re-hashing (~10+ min off a fresh fleet's ramp).
+- **Concurrency:** `_reconcile_cloud_pods` is lease-aware (it no longer
+  terminates a live-leased job's pods), the peer keypair is per-job, and
+  `WEDDING_CLOUD_MULTI=1` permits multiple cloud workers — though current
+  operating doctrine is ONE fleet at a time.
+  Everything above is covered by the mock suites (21 tests) — with the noted
+  humility that schema-level constraints are invisible to the fakes: a state
+  value violating the `cloud_pods` CHECK constraint reached a live run on
+  2026-09-24 before being caught and fixed.
 - `webapp/server/cloud_views.py` adds a read-only `/api/cloud` fleet-status
   endpoint (live pods, uptime, derived spend), rendered as a "Cloud fleet" panel
   on the queue page. It degrades to `{"enabled": false}` on a database without

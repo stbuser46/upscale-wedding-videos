@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 import sqlite3
@@ -13,6 +14,7 @@ from flask import Blueprint, Response, abort, current_app, jsonify, redirect, re
 
 from webapp.db import connect, transaction, utc_now
 from webapp.scan.catalog import scan_all_discs
+from webapp.server.logtail import parse_log_tail, unit_pod_hints
 from webapp.server.reconcile import reconcile_backlog
 from webapp.server.services import (
     PRIORITY_NAMES,
@@ -28,7 +30,7 @@ from webapp.server.services import (
 
 api = Blueprint("api", __name__, url_prefix="/api")
 _QUEUE_ERROR_STATUS = {"skip": 409, "not_found": 404, "invalid": 400}
-JOB_SELECT = """SELECT j.*, d.slug AS disc_slug, t.title_number
+JOB_SELECT = """SELECT j.*, d.slug AS disc_slug, d.collection AS disc_collection, t.title_number
                 FROM jobs j JOIN titles t ON t.id=j.title_id
                 JOIN discs d ON d.id=t.disc_id"""
 
@@ -117,6 +119,24 @@ def worker_health():
     return jsonify(_worker_health_dict(row))
 
 
+def _parse_ts(value) -> datetime | None:
+    """Parse an ISO8601/SQLite timestamp, treating naive stamps as UTC.
+
+    cloud_pods rows mix Python utc_now() (timezone-aware) with SQL
+    datetime('now') (naive UTC, written by teardown/reaper paths), and
+    subtracting a naive from an aware datetime raises TypeError — which
+    500'd the /live endpoint the moment such a row appeared."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def _worker_health_dict(row) -> dict:
     if row is None:
         return {"present": False, "alive": False, "activity": "unknown"}
@@ -130,7 +150,7 @@ def _worker_health_dict(row) -> dict:
         try:
             delta = (datetime.now(UTC) - datetime.fromisoformat(last_beat)).total_seconds()
             alive = delta <= 90
-        except ValueError:
+        except (ValueError, TypeError):
             alive = False
     result["alive"] = alive
     return result
@@ -394,6 +414,98 @@ def job_detail(public_id: str):
     result["artifacts"] = artifacts
     result["free_space_bytes"] = shutil.disk_usage(_settings().data_dir).free
     return jsonify(result)
+
+
+@api.get("/jobs/<public_id>/live")
+def job_live(public_id: str):
+    """Live sub-progress that the DB alone can't show: a durable job only
+    advances jobs.frames_done once per ~750-frame unit (~15 min locally), so
+    this combines the per-unit chip strip (job_chunks — works for local and
+    cloud jobs alike) with a tail-parse of the job's own SeedVR2 log for the
+    current unit's phase/batch/frame-write detail. For cloud jobs, unit->pod
+    attribution is recovered cheaply from the "=== unit N restore on host:port
+    ===" lines the pod executor already prints, matched against this job's
+    cloud_pods rows. Safe to poll every few seconds; degrades to empty/None
+    fields rather than erroring when a job hasn't started or has no log yet."""
+    with _db() as db:
+        job = db.execute("SELECT * FROM jobs WHERE public_id=?", (public_id,)).fetchone()
+        if job is None:
+            abort(404, description="Job not found")
+        chunk_rows = db.execute(
+            "SELECT sequence, state, frame_count FROM job_chunks WHERE job_id=? ORDER BY sequence",
+            (job["id"],),
+        ).fetchall()
+        pod_rows = db.execute(
+            """SELECT pod_id, name, gpu_type, state, hourly_rate, ssh_host, ssh_port,
+                      created_at, ready_at, terminated_at
+               FROM cloud_pods WHERE job_id=? ORDER BY id""",
+            (job["id"],),
+        ).fetchall()
+
+    try:
+        snapshot = json.loads(job["settings_json"])
+    except (TypeError, ValueError):
+        snapshot = {}
+    chunk_size = snapshot.get("chunk") or 750
+    chunks_by_seq = {row["sequence"]: row for row in chunk_rows}
+    # job_chunks rows are created incrementally as the worker reaches each
+    # unit, so max(sequence)+1 undercounts the total until the last unit has
+    # started; frames_total / chunk_size is the true unit count from the start.
+    if job["frames_total"] and chunk_size:
+        units_total = math.ceil(job["frames_total"] / chunk_size)
+    elif chunks_by_seq:
+        units_total = max(chunks_by_seq) + 1
+    else:
+        units_total = None
+
+    log_path = Path(job["log_path"]) if job["log_path"] else None
+    log_info = parse_log_tail(log_path)
+    hints = unit_pod_hints(log_path) if pod_rows else {}
+    pods_by_hostport = {
+        (row["ssh_host"], row["ssh_port"]): row for row in pod_rows if row["ssh_host"] is not None
+    }
+
+    units = []
+    counts = {"valid": 0, "running": 0, "invalid": 0, "pending": 0}
+    span = range(units_total) if units_total is not None else sorted(chunks_by_seq)
+    for seq in span:
+        row = chunks_by_seq.get(seq)
+        state = row["state"] if row else "pending"
+        counts[state] = counts.get(state, 0) + 1
+        pod = None
+        pod_row = pods_by_hostport.get(hints.get(seq))
+        if pod_row is not None:
+            pod = {"pod_id": pod_row["pod_id"], "name": pod_row["name"], "gpu_type": pod_row["gpu_type"]}
+        units.append({
+            "sequence": seq, "state": state,
+            "frame_count": row["frame_count"] if row else None,
+            "pod": pod,
+        })
+
+    now = datetime.now(UTC)
+    pods = []
+    for row in pod_rows:
+        created = _parse_ts(row["created_at"])
+        ended = _parse_ts(row["terminated_at"]) or now
+        lifetime_s = max(0.0, (ended - created).total_seconds()) if created else 0.0
+        rate = row["hourly_rate"] or 0.0
+        pods.append({
+            "pod_id": row["pod_id"], "name": row["name"], "gpu_type": row["gpu_type"], "state": row["state"],
+            "rate_per_hr": rate, "uptime_s": int(round(lifetime_s)), "cost_usd": round(rate * lifetime_s / 3600.0, 2),
+        })
+
+    executor = "cloud" if pod_rows else ("local" if job["worker_pid"] else None)
+    return jsonify({
+        "public_id": job["public_id"],
+        "executor": executor,
+        "state": job["state"],
+        "stage": job["stage"],
+        "units_total": units_total,
+        "units": units,
+        "units_summary": counts,
+        "pods": pods,
+        "log": log_info,
+    })
 
 
 @api.get("/jobs/<public_id>/events")

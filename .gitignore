@@ -40,6 +40,6 @@ node_modules/
 # Runtime-staged SeedVR2 tree for pod provisioning
 docker/seedvr2-pod/_tree/
 docker/seedvr2-pod/inductor_cache.tar
-# Ephemeral per-job pod-to-pod ssh keypair (regenerated each fleet run)
-docker/seedvr2-pod/_jobkey
-docker/seedvr2-pod/_jobkey.pub
+# Ephemeral per-job pod-to-pod ssh keypairs (regenerated each fleet run)
+docker/seedvr2-pod/_jobkey*
+.playwright-mcp/

@@ -1,9 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Queue · Wedding Film Restoration{% endblock %}
+{% block title %}Queue · Video Restoration{% endblock %}
 {% block content %}
 <section class="hero compact"><div><p class="eyebrow">One GPU · durable queue</p><h1>Restoration queue</h1>
 <p>Jobs run one at a time. Cancellation is cooperative and takes effect only after the current major pipeline stage finishes.</p></div></section>
 <aside class="phase-notice"><strong>Pause is not available in Phase 2.</strong> True pause/resume needs independently durable 15-second chunks (Phase 3). Do not close the worker to simulate a pause.</aside>
+<section class="resources-panel" aria-label="Compute resources right now">
+  <p class="eyebrow">Compute now · local &amp; cloud</p>
+  <div id="resources-now-grid" class="cloud-now-grid"><div class="loading">Collecting resource samples…</div></div>
+</section>
 <div class="queue-toolbar" id="queue-filter" role="group" aria-label="Filter jobs">
   <button type="button" class="button small" data-filter="active">Hide finished</button>
   <button type="button" class="button small" data-filter="all">Show all</button>
@@ -12,19 +16,39 @@
 <section id="queue-list" class="queue-list" aria-live="polite"><div class="loading">Loading queue…</div></section>
 <section id="cloud-fleet" class="cloud-panel hidden" aria-label="Cloud GPU fleet">
   <div class="cloud-header">
-    <div><p class="eyebrow">Cloud fleet · RunPod</p><h2>Remote GPU pods</h2></div>
+    <div><p class="eyebrow">Cloud fleet · RunPod</p><h2>Remote GPU pods <span class="scope-badge cloud">Cloud</span></h2></div>
     <span id="cloud-summary" class="cloud-summary-pill" data-level="ok"></span>
+  </div>
+  <div class="queue-toolbar pod-toolbar" id="cloud-pod-filter" role="group" aria-label="Filter pods">
+    <button type="button" class="button small" data-podfilter="active">Hide terminated</button>
+    <button type="button" class="button small" data-podfilter="all">Show all</button>
+    <span class="muted" id="cloud-pod-filter-note"></span>
   </div>
   <div id="cloud-pods" class="cloud-pods" aria-live="polite"></div>
   <div id="cloud-job" class="cloud-job-panel hidden">
     <div class="cloud-job-line"><span id="cloud-job-title" class="muted"></span><span id="cloud-job-spend" class="cloud-job-spend"></span></div>
     <div id="cloud-units" class="cloud-units" aria-label="Per-unit progress"></div>
   </div>
+  <div id="cloud-metrics" class="cloud-metrics-panel hidden" aria-label="Live cloud pod telemetry">
+    <div class="cloud-metrics-header">
+      <p class="eyebrow">Live pod telemetry</p>
+      <span id="cloud-metrics-note" class="muted"></span>
+    </div>
+    <div id="cloud-pod-now" class="cloud-now-grid" aria-label="Live per-pod GPU status"></div>
+    <div id="cloud-metrics-tiles" class="metrics-tiles"></div>
+    <div class="cloud-metrics-grid">
+      <div class="cloud-metric-cell"><h3>GPU utilisation</h3><canvas id="cloud-chart-gpu" height="140" role="img" aria-label="Per-pod GPU utilisation over time"></canvas></div>
+      <div class="cloud-metric-cell"><h3>GPU memory</h3><canvas id="cloud-chart-gpumem" height="140" role="img" aria-label="Per-pod GPU memory utilisation over time"></canvas></div>
+      <div class="cloud-metric-cell"><h3>Container CPU</h3><canvas id="cloud-chart-cpu" height="140" role="img" aria-label="Per-pod CPU utilisation over time"></canvas></div>
+      <div class="cloud-metric-cell"><h3>Accrued cost</h3><canvas id="cloud-chart-cost" height="140" role="img" aria-label="Per-pod accrued cost over time"></canvas></div>
+    </div>
+    <div id="cloud-metrics-legend" class="cloud-metrics-legend" aria-label="Pod legend"></div>
+  </div>
 </section>
-<section class="metrics-panel" aria-label="System load">
+<section class="metrics-panel" aria-label="Local machine load">
   <div class="metrics-header">
-    <div><p class="eyebrow">System load</p><h2>GPU &amp; CPU utilisation</h2>
-      <p id="metrics-local-note" class="muted cloud-local-note hidden">Local homeserver GPU — cloud units run remotely.</p></div>
+    <div><p class="eyebrow">Local machine · homeserver</p><h2>Local GPU &amp; CPU <span class="scope-badge local">Local</span></h2>
+      <p id="metrics-local-status" class="muted cloud-local-note">Checking local worker…</p></div>
     <div class="metrics-ranges" id="metrics-ranges" role="group" aria-label="Time range">
       <button type="button" class="button small" data-minutes="15">15m</button>
       <button type="button" class="button small active" data-minutes="60">1h</button>
