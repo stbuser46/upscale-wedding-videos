@@ -104,6 +104,14 @@ class PodPark:
             key = max(self._pods, key=lambda k: self._pods[k].parked_at)
             return self._pods.pop(key)
 
+    def ids(self) -> set[str]:
+        """Currently-parked pod ids — terminate_all's name-based stray sweep
+        must EXEMPT these (they intentionally outlive their fleet, still
+        guarded by the TTL guardian, the worker drain, and the reaper). The
+        first live park (Seg05→06, 2026-09-25) was wiped by that sweep."""
+        with self._lock:
+            return set(self._pods)
+
     def _watch(self) -> None:
         while True:
             time.sleep(self._interval)
@@ -1186,8 +1194,10 @@ class CloudFleet:
             if wait_s:
                 time.sleep(wait_s)
             try:
+                parked = POD_PARK.ids()  # parked pods outlive this fleet by design
                 for pod in self.client.our_pods():
-                    if pod.get("name", "").startswith(f"{POD_NAME_PREFIX}{self.job['public_id']}-"):
+                    if (pod.get("name", "").startswith(f"{POD_NAME_PREFIX}{self.job['public_id']}-")
+                            and pod["id"] not in parked):
                         self._terminate(pod["id"], pod["name"])
             except Exception:
                 pass
