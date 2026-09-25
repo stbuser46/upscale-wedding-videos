@@ -133,7 +133,7 @@ class FakeFleet:
     def hand_back(self, slot: FakeSlot) -> None:  # not used by pipelined dispatch
         self.slot_queue.put(slot)
 
-    def retire_slot(self, slot: FakeSlot) -> None:
+    def retire_slot(self, slot: FakeSlot, *, parkable: bool = False) -> None:
         self.retired.append(slot.pod_id)
 
     def terminate_all(self) -> None:
@@ -561,7 +561,11 @@ class CloudDispatchTest(unittest.TestCase):
         rc = self.run_dispatch()
         self.assertEqual(rc, 0)
         starts = [e for e in self.events(f"restore:{last_seq}:") if e[1].endswith(":start")]
-        self.assertEqual(len(starts), 2, "the tail unit must be retried on another pod")
+        # >= 2: the failed attempt plus at least one retry. The standby may
+        # ALSO shadow-race the tail unit (straggler duplication, 2026-09-25),
+        # adding a legitimate extra start — the invariant is retried-not-
+        # orphaned plus every unit ending valid, not an exact start count.
+        self.assertGreaterEqual(len(starts), 2, "the tail unit must be retried on another pod")
         valid = sorted(seq for seq, state in self.chunk_records if state == "valid")
         self.assertEqual(valid, [u["seq"] for u in self.units])
 

@@ -83,6 +83,13 @@ def _handle_shutdown(signum, _frame) -> None:
             _ACTIVE_FLEET.terminate_all()
         except Exception as exc:  # never let cleanup crash the handler
             print(f"fleet termination during shutdown failed: {exc}", flush=True)
+    # Keep-alive: pods parked between segments are the worker's to kill — a
+    # stopping worker must never strand a billing pod in the park.
+    try:
+        from webapp.cloud.fleet import POD_PARK
+        POD_PARK.shutdown()
+    except Exception as exc:
+        print(f"pod park drain during shutdown failed: {exc}", flush=True)
 
 
 def _install_signal_handlers() -> None:
@@ -1246,6 +1253,17 @@ def _cloud_fleet_config(settings: Settings):
     gpu_ids = [p.strip() for p in prefs.split(",") if p.strip()]
     provision_dir = _stage_seedvr2_tree(settings)
     cache = settings.data_dir / "restoration_work" / ".inductor_cache"
+    # Keep-alive parking only makes sense when ANOTHER cloud segment is
+    # queued behind the current one — otherwise the tail retires as always.
+    keep_alive = False
+    if os.environ.get("WEDDING_CLOUD_KEEP_ALIVE") == "1":
+        try:
+            with connect(settings.database_path) as db:
+                keep_alive = db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE state='queued' "
+                    "AND start_requested=1").fetchone()[0] > 0
+        except Exception:
+            keep_alive = False
     return FleetConfig(
         image=os.environ.get("WEDDING_CLOUD_IMAGE", STOCK_BASE_IMAGE),
         gpu_type_ids=gpu_ids,
@@ -1259,6 +1277,7 @@ def _cloud_fleet_config(settings: Settings):
         # actually use it — gate-off provisioning stays byte-identical to the
         # classic path (Codex round-3 finding #7).
         pod_engine=os.environ.get("WEDDING_POD_ENGINE") == "1",
+        keep_alive=keep_alive,
     )
 
 
@@ -1946,7 +1965,9 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     t.join()
                 if hard_stop() is None and not fleet.capped:
                     # No more work / pause / pod suspect: stop billing now.
-                    fleet.retire_slot(slot)
+                    # A healthy pod may be parked for the next segment
+                    # (keep-alive); a suspect one must actually die.
+                    fleet.retire_slot(slot, parkable=not pod_bad.is_set())
                     if pod_bad.is_set() and stop_reason() is None and queue_has_work():
                         # A WORKING pod died with units still queued: recover
                         # capacity instead of letting the fleet only shrink.
@@ -2238,6 +2259,13 @@ def main(argv: list[str] | None = None) -> None:
                     time.sleep(max(0.2, args.poll_seconds))
         finally:
             renew_stop.set()
+            # Any pods still parked when the claim loop ends (--once, queue
+            # empty at shutdown) are this worker's to kill.
+            try:
+                from webapp.cloud.fleet import POD_PARK
+                POD_PARK.shutdown()
+            except Exception as exc:
+                print(f"pod park drain at exit failed: {exc}", flush=True)
         if _SHUTDOWN:
             _heartbeat(settings, "stopped")
 

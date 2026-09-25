@@ -50,6 +50,98 @@ class Slot:
 
 
 @dataclass
+class ParkedPod:
+    """A healthy, fully-provisioned pod handed across a segment boundary
+    (WEDDING_CLOUD_KEEP_ALIVE=1) instead of being retired — so the next
+    segment starts at width without re-running the create-lottery."""
+    pod_id: str
+    name: str
+    endpoint: tuple[str, int]
+    gpu_type: str
+    hourly_rate: float
+    ledger_id: int | None
+    parked_at: float                       # monotonic
+    ttl_s: float
+    terminate_cb: Callable[[], None]       # provider-kill + honest ledger close
+
+
+class PodPark:
+    """Worker-lifetime registry of pods parked between cloud segments.
+
+    Money-safety, in layers: (1) every parked pod keeps its OPEN ledger row,
+    so it never disappears from billing visibility; (2) a guardian thread
+    hard-kills any pod parked past its TTL (idle insurance is bounded);
+    (3) the worker's shutdown path drains the park (kills everything unadopted);
+    (4) the independent reaper timer and the RunPod account spend limit remain
+    the out-of-process backstops if the worker dies uncleanly. Adoption closes
+    the old job's ledger row ('handed_off', accrual ends) and the adopting
+    fleet opens a new row from the adoption instant — coverage is continuous,
+    with zero double-count and zero gap."""
+
+    def __init__(self, *, guardian_interval_s: float = 20.0) -> None:
+        self._lock = threading.Lock()
+        self._pods: dict[str, ParkedPod] = {}
+        self._guardian: threading.Thread | None = None
+        self._interval = guardian_interval_s
+        self._log: Callable[[str], None] = print
+
+    def park(self, pod: ParkedPod, *, log: Callable[[str], None]) -> None:
+        with self._lock:
+            self._pods[pod.pod_id] = pod
+            self._log = log
+            if self._guardian is None or not self._guardian.is_alive():
+                self._guardian = threading.Thread(
+                    target=self._watch, daemon=True, name="pod-park-guardian")
+                self._guardian.start()
+        log(f"[fleet] parked pod {pod.pod_id} for the next segment "
+            f"(TTL {pod.ttl_s / 60:.0f} min; guardian armed)")
+
+    def pop(self) -> ParkedPod | None:
+        with self._lock:
+            if not self._pods:
+                return None
+            # Newest first: it has the most TTL left.
+            key = max(self._pods, key=lambda k: self._pods[k].parked_at)
+            return self._pods.pop(key)
+
+    def _watch(self) -> None:
+        while True:
+            time.sleep(self._interval)
+            now = time.monotonic()
+            with self._lock:
+                expired = [p for p in self._pods.values()
+                           if now - p.parked_at > p.ttl_s]
+                for p in expired:
+                    self._pods.pop(p.pod_id, None)
+            for p in expired:
+                self._log(f"[fleet] parked pod {p.pod_id} exceeded its "
+                          f"{p.ttl_s / 60:.0f} min TTL unadopted; terminating")
+                try:
+                    p.terminate_cb()
+                except Exception as exc:
+                    self._log(f"[fleet] WARN park TTL kill of {p.pod_id} failed "
+                              f"({str(exc)[:80]}); reaper backstop will catch it")
+
+    def shutdown(self) -> None:
+        """Kill every unadopted parked pod — called from the worker's own
+        shutdown path so a clean exit never strands a billing pod."""
+        with self._lock:
+            pods = list(self._pods.values())
+            self._pods.clear()
+        for p in pods:
+            self._log(f"[fleet] draining pod park at worker shutdown: "
+                      f"terminating {p.pod_id}")
+            try:
+                p.terminate_cb()
+            except Exception as exc:
+                self._log(f"[fleet] WARN park drain kill of {p.pod_id} failed "
+                          f"({str(exc)[:80]}); reaper backstop will catch it")
+
+
+POD_PARK = PodPark()
+
+
+@dataclass
 class FleetConfig:
     image: str
     gpu_type_ids: list[str]
@@ -57,6 +149,8 @@ class FleetConfig:
     max_slots: int = 16
     spend_cap_usd: float = 250.0
     pod_ttl_s: float = 3600.0          # terminate a pod older than this (unit ~15 min)
+    keep_alive: bool = False           # park tail pods for the NEXT queued segment
+    park_ttl_s: float = 1800.0         # parked pod hard TTL (assembly + prepare fit in 30 min)
     container_disk_gb: int = 40           # a pod uses ~16 GiB (base+weights+cache); 120 caused 'no resources' rejections
     bring_up_attempts: int = 3            # recreate on a create-reject or no-ssh dud
     max_tree_upload_s: float = 60.0       # ingress gate: 6 MB tree slower than this = hopeless host
@@ -366,7 +460,7 @@ class CloudFleet:
                     break
         for slot in stranded:
             self.log(f"[fleet] retiring unclaimed pod {slot.pod_id} (no work remains)")
-            self.retire_slot(slot)
+            self.retire_slot(slot, parkable=True)
 
     def hand_back(self, slot: "Slot") -> None:
         """Return a healthy slot to the queue after it finished a unit, and
@@ -375,16 +469,106 @@ class CloudFleet:
         slot.created_at = time.monotonic()
         self.slot_queue.put(slot)
 
-    def retire_slot(self, slot: "Slot") -> None:
+    def retire_slot(self, slot: "Slot", *, parkable: bool = False) -> None:
         """Terminate a pod that has no more work, immediately, so it stops
         billing the moment its last unit is done rather than idling until the
-        whole job ends. Fixes the tail where early-finishing pods sit idle."""
+        whole job ends. Fixes the tail where early-finishing pods sit idle.
+
+        With keep-alive on (WEDDING_CLOUD_KEEP_ALIVE=1) a HEALTHY idle pod
+        (`parkable=True` — never set for suspect/stale pods) is parked for the
+        next queued segment instead: it skips that segment's create-lottery
+        and provisioning entirely. Parked pods stay on their open ledger row,
+        under the park guardian's hard TTL, the worker's shutdown drain, and
+        the reaper backstop."""
         with self._lock:
             self._slots.pop(slot.pod_id, None)
             self._ready = max(0, self._ready - 1)
         self._drop_staging_candidate(slot.endpoint)
+        if parkable and self.cfg.keep_alive and not self._stop.is_set():
+            POD_PARK.park(ParkedPod(
+                pod_id=slot.pod_id, name=slot.name, endpoint=slot.endpoint,
+                gpu_type=slot.gpu_type, hourly_rate=slot.hourly_rate,
+                ledger_id=slot.ledger_id, parked_at=time.monotonic(),
+                ttl_s=self.cfg.park_ttl_s,
+                terminate_cb=lambda: self._terminate(
+                    slot.pod_id, slot.name, ledger_id=slot.ledger_id),
+            ), log=self.log)
+            return
         self._terminate(slot.pod_id, slot.name, ledger_id=slot.ledger_id)
         self.log(f"[fleet] retired idle pod {slot.pod_id} (no more units)")
+
+    def _try_adopt(self, index: int) -> bool:
+        """Adopt a pod parked by the previous segment instead of creating one.
+
+        The pod is already gate-passed, provisioned, warm-cached and (in
+        engine mode) carries pod_engine.py — adoption is one ssh round-trip:
+        kill any stragglers, wipe the previous segment's slices/units, verify
+        the tree. Ledger handoff is continuous: the old job's row closes
+        ('handed_off') at the same instant the adopting job's row opens, so
+        the pod is never invisible to billing and never double-counted. A pod
+        that fails verification is terminated on the spot and the caller falls
+        back to the normal create path."""
+        while True:
+            parked = POD_PARK.pop()
+            if parked is None:
+                return False
+            t0 = time.monotonic()
+            try:
+                res = run_ssh(parked.endpoint, ["bash", "-c",
+                              "pkill -f pod_engine.py 2>/dev/null; "
+                              "pkill -f inference_cli 2>/dev/null; "
+                              "rm -rf /workspace/slices/* /workspace/units/* "
+                              "/workspace/relay_* 2>/dev/null; "
+                              "test -f /opt/SeedVR2/inference_cli.py && echo ADOPT_OK"],
+                              ssh_key=self.cfg.ssh_key, check=False, timeout=30)
+                ok = "ADOPT_OK" in (res.stdout or "")
+            except Exception:
+                ok = False
+            if not ok:
+                self.log(f"[fleet] parked pod {parked.pod_id} failed adoption "
+                         f"check; terminating and trying the next one")
+                try:
+                    parked.terminate_cb()
+                except Exception as exc:
+                    self.log(f"[fleet] WARN could not kill unadoptable pod "
+                             f"{parked.pod_id} ({str(exc)[:80]}); reaper will")
+                continue
+            # Ledger handoff: close the previous job's row, open this job's.
+            row_id = self._ledger_insert(parked.name, parked.gpu_type,
+                                         parked.hourly_rate)
+            self._ledger_row(row_id, pod_id=parked.pod_id, state="adopted",
+                             hourly_rate=parked.hourly_rate)
+            if parked.ledger_id is not None:
+                try:
+                    self._ledger_row(parked.ledger_id, state="handed_off",
+                                     terminated_at=_now_iso())
+                except Exception:
+                    pass  # old row stays open: conservative (over-counts old job)
+            slot = Slot(pod_id=parked.pod_id, name=parked.name,
+                        endpoint=parked.endpoint, gpu_type=parked.gpu_type,
+                        hourly_rate=parked.hourly_rate,
+                        created_at=time.monotonic(), ledger_id=row_id)
+            with self._lock:
+                no_work = self._no_more_work.is_set()
+                if not no_work:
+                    self._slots[slot.pod_id] = slot
+                    self._ready += 1
+            if no_work:
+                self.log(f"[fleet] adopted pod {parked.pod_id} not needed "
+                         f"(no work remains); terminating")
+                self._terminate(slot.pod_id, slot.name, ledger_id=row_id)
+                return True
+            with self._cache_cv:
+                # It still holds the warm-cache tarball: let siblings peer-fetch.
+                self._cache_seeds.append(slot.endpoint)
+                self._cache_cv.notify_all()
+            self._register_staging_candidate(slot.endpoint)
+            self.slot_queue.put(slot)
+            self.log(f"[fleet] pod {index} ADOPTED {parked.pod_id} from the "
+                     f"previous segment ({time.monotonic() - t0:.0f}s — no "
+                     f"create-lottery, no provisioning) READY at "
+                     f"{slot.endpoint[0]}:{slot.endpoint[1]}")
+            return True
 
     def _bring_up(self, index: int) -> None:
         if self._stop.is_set():
@@ -392,6 +576,8 @@ class CloudFleet:
         # Spend-cap guard before spending on another pod.
         if self.spend_so_far() >= self.cfg.spend_cap_usd:
             self.log(f"[fleet] spend cap ${self.cfg.spend_cap_usd:.0f} reached; not launching pod {index}")
+            return
+        if self.cfg.keep_alive and self._try_adopt(index):
             return
         name = f"{POD_NAME_PREFIX}{self.job['public_id']}-{index}"
         gpu_type = self.cfg.gpu_type_ids[0]

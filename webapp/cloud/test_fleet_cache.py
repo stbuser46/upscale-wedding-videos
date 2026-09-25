@@ -297,3 +297,116 @@ class FleetIntermediateStoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PodParkKeepAliveTest(unittest.TestCase):
+    """Keep-alive (WEDDING_CLOUD_KEEP_ALIVE=1): healthy tail pods are parked,
+    the next fleet adopts them without create/provision, TTL and shutdown
+    drains kill anything unadopted, and suspect pods are never parked."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory(prefix="fleet-park-test-")
+        tmp = Path(self._tmp.name)
+        (tmp / "provision").mkdir()
+        self.ssh_calls: list[tuple] = []
+        self.adopt_ok = True
+        self.terminated: list[str] = []
+
+        def fake_run_ssh(endpoint, command, *, ssh_key=None, check=True, capture=True, timeout=None):
+            script = command if isinstance(command, str) else " ".join(map(str, command))
+            self.ssh_calls.append((endpoint, script))
+            out = "ADOPT_OK\n" if (self.adopt_ok and "ADOPT_OK" in script) else ""
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+        self._patches = []
+
+        def patch(name, value):
+            self._patches.append((name, getattr(fleet_mod, name)))
+            setattr(fleet_mod, name, value)
+
+        patch("run_ssh", fake_run_ssh)
+        patch("rsync", lambda *a, **k: None)
+        patch("RunpodClient", lambda: SimpleNamespace())
+        patch("ensure_ssh_key", lambda key: "ssh-ed25519 FAKE")
+
+        cfg = FleetConfig(image="fake", gpu_type_ids=["FAKE GPU"],
+                          provision_dir=tmp / "provision", inductor_cache=None,
+                          ssh_key=tmp / "operator_key", keep_alive=True,
+                          park_ttl_s=30.0)
+        settings = SimpleNamespace(database_path=tmp / "unused.sqlite", data_dir=tmp)
+        self.fleet = CloudFleet(settings, {"id": 2, "public_id": "parktest"}, cfg,
+                                log=lambda m: None)
+        # Ledger stubs: record calls, no real DB.
+        self.ledger_rows: list[tuple] = []
+        self.fleet._ledger_insert = lambda name, gpu, rate: self.ledger_rows.append(("insert", name)) or 77
+        self.fleet._ledger_row = lambda rid, **cols: self.ledger_rows.append(("update", rid, cols))
+        self.fleet._terminate = lambda pod_id, name, ledger_id=None: self.terminated.append(pod_id)
+        # Isolated park per test.
+        self.park = fleet_mod.PodPark(guardian_interval_s=0.05)
+        self._old_park = fleet_mod.POD_PARK
+        fleet_mod.POD_PARK = self.park
+
+    def tearDown(self):
+        fleet_mod.POD_PARK = self._old_park
+        for name, value in self._patches:
+            setattr(fleet_mod, name, value)
+        self._tmp.cleanup()
+
+    def _slot(self, i):
+        return fleet_mod.Slot(pod_id=f"pod{i}", name=f"wedding-parktest-{i}",
+                              endpoint=(f"10.0.0.{i}", 22000 + i), gpu_type="FAKE GPU",
+                              hourly_rate=2.09, created_at=time.monotonic(), ledger_id=i)
+
+    def test_healthy_retire_parks_and_next_fleet_adopts(self):
+        self.fleet._slots["pod1"] = self._slot(1)
+        self.fleet._ready = 1
+        self.fleet.retire_slot(self._slot(1), parkable=True)
+        self.assertEqual(self.terminated, [], "parked pod must NOT be terminated")
+        self.assertTrue(self.fleet._try_adopt(0), "adoption must succeed")
+        self.assertIn("pod1", self.fleet._slots)
+        self.assertEqual(self.fleet.slot_queue.qsize(), 1)
+        wipes = [s for _, s in self.ssh_calls if "ADOPT_OK" in s]
+        self.assertTrue(wipes and "rm -rf /workspace/slices/*" in wipes[0],
+                        "adoption must wipe the previous segment's files")
+        kinds = [r[0] for r in self.ledger_rows]
+        self.assertIn("insert", kinds, "adopting job must open its own ledger row")
+        handoffs = [r for r in self.ledger_rows
+                    if r[0] == "update" and r[2].get("state") == "handed_off"]
+        self.assertTrue(handoffs, "old job's row must be closed as handed_off")
+
+    def test_suspect_pod_is_never_parked(self):
+        self.fleet.retire_slot(self._slot(2), parkable=False)
+        self.assertEqual(self.terminated, ["pod2"])
+        self.assertIsNone(self.park.pop())
+
+    def test_failed_adoption_check_terminates_and_falls_back(self):
+        self.adopt_ok = False
+        killed = []
+        self.park.park(fleet_mod.ParkedPod(
+            pod_id="podX", name="n", endpoint=("10.0.0.9", 22), gpu_type="g",
+            hourly_rate=2.09, ledger_id=9, parked_at=time.monotonic(),
+            ttl_s=30.0, terminate_cb=lambda: killed.append("podX")), log=lambda m: None)
+        self.assertFalse(self.fleet._try_adopt(0), "must fall back to create path")
+        self.assertEqual(killed, ["podX"])
+
+    def test_ttl_guardian_kills_unadopted_pod(self):
+        killed = []
+        self.park.park(fleet_mod.ParkedPod(
+            pod_id="podT", name="n", endpoint=("10.0.0.8", 22), gpu_type="g",
+            hourly_rate=2.09, ledger_id=8, parked_at=time.monotonic(),
+            ttl_s=0.01, terminate_cb=lambda: killed.append("podT")), log=lambda m: None)
+        deadline = time.monotonic() + 3.0
+        while not killed and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(killed, ["podT"], "guardian must TTL-kill unadopted pods")
+        self.assertIsNone(self.park.pop())
+
+    def test_shutdown_drains_park(self):
+        killed = []
+        self.park.park(fleet_mod.ParkedPod(
+            pod_id="podS", name="n", endpoint=("10.0.0.7", 22), gpu_type="g",
+            hourly_rate=2.09, ledger_id=7, parked_at=time.monotonic(),
+            ttl_s=300.0, terminate_cb=lambda: killed.append("podS")), log=lambda m: None)
+        self.park.shutdown()
+        self.assertEqual(killed, ["podS"])
+        self.assertIsNone(self.park.pop())
