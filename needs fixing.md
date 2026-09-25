@@ -58,6 +58,21 @@ bloat audio, video stream-copy unchanged); the warm engine is fully inert with
 > diff the full effective args/branches), then re-canary (~$1.5). The
 > reuse machinery itself needs no further work.
 
+> **RESOLVED (2026-09-25, later the same day):** exactly that fix landed
+> (`pod_engine.py` pins the offload target to the compute GPU itself, so the
+> cache-enabled "offload" moves are same-device no-ops; commit be1a765) and
+> the re-canary program ran on a fresh paid RTX PRO 6000 Blackwell SE pod
+> (`nk4yyxl70p1dwg`, ~$3 total):
+> - **Small-cap diagnostic (caps 150/100): PASS** — hashes `f7de7a0d…`/
+>   `759a05d9…` identical one-shot vs engine on both shapes.
+> - **Full-size acceptance (caps 750/350, production shapes): PASS** —
+>   hashes `347b5342…`/`7591cbfb…` identical on both shapes, one persistent
+>   engine pid, DiT+VAE reuse proven in logs, engine A-request 27% faster
+>   than one-shot (886 s vs 1208 s).
+> This PASS binds the RTX PRO 6000 Blackwell SE class — the only type in
+> the fleet's preference list. **WEDDING_POD_ENGINE=1 is cleared for
+> production on this GPU class**; re-canary before adding any other class.
+
 ## QUEUED NEXT (user-approved 2026-09-24): warm-worker engine, after disc 1
 
 Keep cloud GPUs busy ~95%+ by eliminating the two remaining engine-internal
