@@ -78,7 +78,7 @@ docker run --rm "${PROJECT_MOUNTS[@]}" \
   -i "/proj/${VIDEO_CONCAT#"$PROJ/"}" \
   -ss "$AUDIO_SEEK" -t "$AUDIO_READ" -i "/proj/${IN#"$PROJ/"}" \
   -map 0:v:0 -map 1:a:0 -c:v copy \
-  -af "atrim=start=$AUDIO_TRIM:duration=$DUR,asetpts=N/SR/TB" \
+  -af "atrim=start=$AUDIO_TRIM:duration=$DUR,asetpts=N/SR/TB,apad" \
   -c:a flac -sample_fmt s16 -compression_level 8 -shortest \
   -metadata title="Wedding DVD restoration — SeedVR2 50p" \
   "/proj/${OUT_PART#"$PROJ/"}"

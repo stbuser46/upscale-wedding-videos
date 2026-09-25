@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest import mock
 
 import webapp.cloud.fleet as fleet_mod
 from webapp.cloud.fleet import CloudFleet, FleetConfig
@@ -117,6 +118,40 @@ class FleetCacheSeedingTest(unittest.TestCase):
         self.fleet._stop.set()
         with self.assertRaises(RunpodError):
             self.fleet._ensure_cache_on_pod(("10.0.0.9", 22999), 9, lambda label, fn: fn())
+
+    def test_provisioning_ships_pod_engine_only_when_gated_on(self):
+        # Codex round-3 finding #7: with WEDDING_POD_ENGINE unset, provisioning
+        # must be byte-identical to baseline — no extra fallible pod_engine
+        # transfer that could reject a pod the classic path would accept.
+        class FakeProvisionPopen:
+            def __init__(self, cmd, stdout=None, stderr=None, text=None):
+                stdout.write("POD READY\n")
+                self.returncode = 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        self.fleet.cfg.inductor_cache = None  # cache seeding covered elsewhere
+        self.fleet._ensure_jobkey = lambda: (Path("/tmp/fake-jobkey"),
+                                             "ssh-ed25519 FAKEJOB")
+
+        def engine_ships():
+            return [c for c in self.rsync_calls
+                    if c[2] == "/opt/SeedVR2/pod_engine.py"]
+
+        with mock.patch.object(fleet_mod.subprocess, "Popen", FakeProvisionPopen):
+            self.assertFalse(self.fleet.cfg.pod_engine, "gate must default OFF")
+            self.fleet._provision_pod(("10.0.0.1", 22001), 1)
+            self.assertEqual(engine_ships(), [],
+                             "gate off: pod_engine.py must NOT be shipped")
+            self.fleet.cfg.pod_engine = True
+            self.fleet._provision_pod(("10.0.0.2", 22002), 2)
+            self.assertEqual(len(engine_ships()), 1,
+                             "gate on: pod_engine.py ships once per pod")
+            self.assertEqual(engine_ships()[0][0], ("10.0.0.2", 22002))
 
 
 class FleetIntermediateStoreTest(unittest.TestCase):

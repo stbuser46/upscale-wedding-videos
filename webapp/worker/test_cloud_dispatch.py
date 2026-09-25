@@ -12,6 +12,7 @@ Run:  webapp/.venv/bin/python -m unittest webapp.worker.test_cloud_dispatch -v
 from __future__ import annotations
 
 import json
+import os
 import queue as _queue
 import threading
 import time
@@ -19,6 +20,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest import mock
 
 import webapp.worker.runner as runner
 import webapp.cloud.fleet as fleet_mod
@@ -144,6 +146,42 @@ class FakeFleet:
         self.terminate_all()
 
 
+class FakePodEngine:
+    """Stands in for executor.PodEngine: records lifecycle, no subprocess."""
+
+    instances: list["FakePodEngine"] = []
+    barrier_verdict = True  # scripted shutdown_barrier() outcome
+
+    def __init__(self, command, *, name: str = "", ready_timeout_s: float = 120.0,
+                 remote_killer=None):
+        self.command = list(command)
+        self.name = name
+        self.ready_timeout_s = ready_timeout_s
+        self.remote_killer = remote_killer
+        self.started = 0
+        self.closed = 0
+        self.barrier_calls = 0
+        self._dead = False
+        FakePodEngine.instances.append(self)
+
+    @property
+    def alive(self) -> bool:
+        return not self._dead
+
+    def start(self) -> bool:
+        self.started += 1
+        return not self._dead
+
+    def close(self) -> None:
+        self.closed += 1
+        self._dead = True
+
+    def shutdown_barrier(self) -> bool:
+        self.barrier_calls += 1
+        self._dead = True
+        return self.barrier_verdict
+
+
 class FakeExec:
     """Fake executor phases with an event log and scriptable failures."""
 
@@ -153,6 +191,10 @@ class FakeExec:
         self.fail_upload: dict[int, int] = {}
         self.fail_restore: dict[int, int] = {}
         self.fail_download: dict[int, int] = {}
+        self.fail_engine: dict[int, int] = {}
+        self.raise_engine: dict[int, int] = {}       # engine path raises (finding #2)
+        self.unverified_engine: dict[int, int] = {}  # kill barrier failed (finding #1)
+        self.classic_budgets: list[float] = []       # max_run_s seen by restore_unit
         self.restores_done = 0
         self.after_restore = lambda count: None  # hook (e.g. request a pause)
 
@@ -181,6 +223,8 @@ class FakeExec:
                      resolution, batch, overlap, log_path,
                      should_abort=lambda: False, poll=2.0, max_run_s=3600.0):
         seq = unit["seq"]
+        with self.lock:
+            self.classic_budgets.append(max_run_s)
         self._ev(f"restore:{seq}:start", endpoint[0])
         t0 = time.monotonic()
         while time.monotonic() - t0 < RESTORE_S:
@@ -196,6 +240,36 @@ class FakeExec:
         if self._consume(self.fail_restore, seq):
             return UnitResult(status=1, message=f"fake restore fail {seq}")
         return UnitResult(status=0, restore_s=RESTORE_S)
+
+    def restore_unit_via_engine(self, engine, *, slice_name, out_name, unit, model,
+                                resolution, batch, overlap, log_path,
+                                should_abort=lambda: False, poll=2.0,
+                                max_run_s=3600.0, stall_s=900.0):
+        seq = unit["seq"]
+        pod = engine.name.split(":")[0]  # runner names engines host:port
+        if self._consume(self.raise_engine, seq):
+            self._ev(f"engine:{seq}:raise", pod)
+            raise RuntimeError(f"fake engine explosion {seq}")
+        self._ev(f"engine:{seq}:start", pod)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < RESTORE_S:
+            if should_abort():
+                self._ev(f"engine:{seq}:aborted", pod)
+                return UnitResult(status=-1, message="aborted")
+            time.sleep(0.005)
+        if self._consume(self.unverified_engine, seq):
+            self._ev(f"engine:{seq}:unverified", pod)
+            return UnitResult(status=3,
+                              message=f"fake stall {seq}; remote engine death UNVERIFIED")
+        if self._consume(self.fail_engine, seq):
+            self._ev(f"engine:{seq}:fail", pod)
+            return UnitResult(status=1, message=f"fake engine death {seq}")
+        self._ev(f"engine:{seq}:end", pod)
+        with self.lock:
+            self.restores_done += 1
+            count = self.restores_done
+        self.after_restore(count)
+        return UnitResult(status=0, restore_s=RESTORE_S, frames=unit["new"])
 
     def download_unit(self, endpoint, ssh_key, *, local_out, unit, log_path,
                       should_abort=lambda: False, timeout=1800):
@@ -283,6 +357,10 @@ class CloudDispatchTest(unittest.TestCase):
         patch(exec_mod, "upload_unit_slice", self.fake_exec.upload_unit_slice)
         patch(exec_mod, "restore_unit", self.fake_exec.restore_unit)
         patch(exec_mod, "download_unit", self.fake_exec.download_unit)
+        patch(exec_mod, "restore_unit_via_engine", self.fake_exec.restore_unit_via_engine)
+        patch(exec_mod, "PodEngine", FakePodEngine)
+        FakePodEngine.instances = []
+        FakePodEngine.barrier_verdict = True
         patch(slicer_mod, "slice_unit", fake_slice)
         patch(runner, "_chunk_valid", lambda *a, **k: False)
         patch(runner, "_units_frames_done", lambda *a, **k: 0)
@@ -502,6 +580,127 @@ class CloudDispatchTest(unittest.TestCase):
         finally:
             runner._cloud_fleet_config = patched
         self.assertIn("never ran", str(ctx.exception))
+
+    # ------------------------------------------- warm engine (WEDDING_POD_ENGINE)
+
+    def test_engine_gate_off_never_touches_the_engine(self):
+        # The default environment (gate unset) must be byte-identical to the
+        # classic path: no engine is even instantiated.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("WEDDING_POD_ENGINE", None)
+            rc = self.run_dispatch()
+        self.assertEqual(rc, 0)
+        self.assertEqual(FakePodEngine.instances, [])
+        self.assertEqual(self.events("engine:"), [])
+        starts = [e for e in self.events("restore:") if e[1].endswith(":start")]
+        self.assertEqual(len(starts), len(self.units))
+
+    def test_engine_enabled_restores_every_unit_without_one_shot_ssh(self):
+        with mock.patch.dict(os.environ, {"WEDDING_POD_ENGINE": "1"}):
+            rc = self.run_dispatch()
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.assembled.is_set())
+        valid = sorted(seq for seq, state in self.chunk_records if state == "valid")
+        self.assertEqual(valid, [u["seq"] for u in self.units])
+        # Every restore ran on the resident engine; the classic path never fired.
+        engine_ends = [e for e in self.events("engine:") if e[1].endswith(":end")]
+        self.assertEqual(len(engine_ends), len(self.units))
+        self.assertEqual(self.events("restore:"), [])
+        # One engine per claimed pod, spawned eagerly and closed in the
+        # runner's finally before retirement.
+        self.assertEqual(len(FakePodEngine.instances), 3)
+        for eng in FakePodEngine.instances:
+            self.assertGreaterEqual(eng.started, 1)
+            self.assertGreaterEqual(eng.closed, 1)
+        self.assertEqual(len(FakeFleet.last.retired), 3)
+
+    def test_engine_death_falls_back_to_classic_on_the_same_pod_without_a_strike(self):
+        # An engine-layer failure must NOT condemn the pod or burn a unit
+        # attempt: the same unit re-runs via the classic one-shot path on the
+        # SAME pod, and that verdict decides.
+        self.fake_exec.fail_engine = {2: 1}
+        with mock.patch.dict(os.environ, {"WEDDING_POD_ENGINE": "1"}):
+            rc = self.run_dispatch()
+        self.assertEqual(rc, 0)
+        valid = sorted(seq for seq, state in self.chunk_records if state == "valid")
+        self.assertEqual(valid, [u["seq"] for u in self.units])
+        fails = [e for e in self.events("engine:2:") if e[1].endswith(":fail")]
+        self.assertEqual(len(fails), 1)
+        classic = [e for e in self.events("restore:2:") if e[1].endswith(":start")]
+        self.assertEqual(len(classic), 1, "the classic path must re-run the unit once")
+        self.assertEqual(classic[0][2], fails[0][2],
+                         "the fallback must run on the SAME pod (no requeue, no strike)")
+        # No 'invalid' attempt was recorded for the engine-layer failure —
+        # the unit's attempt budget is untouched by engine trouble.
+        self.assertNotIn((2, "invalid"), self.chunk_records)
+        # No pod was condemned: no replacement was ever requested.
+        self.assertEqual(getattr(FakeFleet.last, "replacements_requested", 0), 0)
+        # The failed pod's engine was closed on failure; the pod itself kept
+        # working (its later units ran classic) and retired normally at the end.
+        self.assertEqual(len(FakeFleet.last.retired), 3)
+        failed_pod = fails[0][2]
+        later_classic = [e for e in self.events("restore:")
+                         if e[1].endswith(":start") and e[2] == failed_pod]
+        self.assertGreaterEqual(len(later_classic), 1)
+
+    def test_engine_exception_falls_back_with_barrier_and_remaining_budget(self):
+        # Codex round-3 finding #2: an EXCEPTION escaping the engine path
+        # (log I/O, argv build, callback) must behave exactly like a returned
+        # failure — kill barrier, classic fallback on the same pod, no unit
+        # attempt burned, no pod condemned. Finding #5: the fallback runs on
+        # the REMAINDER of the unit's wall-clock budget, not a fresh one.
+        self.fake_exec.raise_engine = {2: 1}
+        with mock.patch.dict(os.environ, {"WEDDING_POD_ENGINE": "1"}):
+            rc = self.run_dispatch()
+        self.assertEqual(rc, 0)
+        valid = sorted(seq for seq, state in self.chunk_records if state == "valid")
+        self.assertEqual(valid, [u["seq"] for u in self.units])
+        raises = self.events("engine:2:raise")
+        self.assertEqual(len(raises), 1)
+        classic = [e for e in self.events("restore:2:") if e[1].endswith(":start")]
+        self.assertEqual(len(classic), 1, "the classic path must re-run the unit once")
+        self.assertEqual(classic[0][2], raises[0][2],
+                         "verified-clean fallback runs on the SAME pod")
+        self.assertNotIn((2, "invalid"), self.chunk_records)
+        self.assertEqual(getattr(FakeFleet.last, "replacements_requested", 0), 0)
+        # The raising pod's engine went through the kill barrier before the
+        # fallback started.
+        self.assertEqual(sum(e.barrier_calls for e in FakePodEngine.instances), 1)
+        # Deadline parity: exactly one classic call is the fallback, and it
+        # received strictly less than the full unit budget (min 600 s floor);
+        # any later classic restores on that engine-less pod get a fresh one.
+        fallback = [b for b in self.fake_exec.classic_budgets if b < 3600.0]
+        self.assertEqual(len(fallback), 1)
+        self.assertGreaterEqual(fallback[0], 600.0)
+
+    def test_engine_unverified_death_requeues_without_attempt_and_retires_pod(self):
+        # Codex round-3 finding #1: when the kill barrier cannot VERIFY the
+        # remote engine died, a zombie restore may still hold that GPU — the
+        # unit must requeue to ANOTHER pod (no attempt burned, no classic
+        # fallback on the suspect pod) and the pod must retire.
+        self.fake_exec.unverified_engine = {2: 1}
+        with mock.patch.dict(os.environ, {"WEDDING_POD_ENGINE": "1"}):
+            rc = self.run_dispatch()
+        self.assertEqual(rc, 0)
+        valid = sorted(seq for seq, state in self.chunk_records if state == "valid")
+        self.assertEqual(valid, [u["seq"] for u in self.units])
+        unverified = self.events("engine:2:unverified")
+        self.assertEqual(len(unverified), 1)
+        bad_pod = unverified[0][2]
+        # NOTHING else ran on the suspect pod after the unverified death: no
+        # classic fallback for unit 2 anywhere (it re-ran via another engine).
+        self.assertEqual(self.events("restore:2:"), [])
+        retries = [e for e in self.events("engine:2:") if e[1].endswith(":end")]
+        self.assertEqual(len(retries), 1)
+        self.assertNotEqual(retries[0][2], bad_pod,
+                            "the retry must land on a DIFFERENT pod")
+        # No attempt burned: the unit never went 'invalid'.
+        self.assertNotIn((2, "invalid"), self.chunk_records)
+        # The suspect pod was retired.
+        time.sleep(0.1)  # let its runner's finally complete
+        bad_ids = [i for i in range(3) if f"10.0.0.{i}" == bad_pod]
+        self.assertEqual(len(bad_ids), 1)
+        self.assertIn(f"pod{bad_ids[0]}", FakeFleet.last.retired)
 
 
 if __name__ == "__main__":

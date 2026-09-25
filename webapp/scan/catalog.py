@@ -384,6 +384,9 @@ def _generate_chapter_media(settings: Settings, row: object, *, force: bool) -> 
     thumbnail = output_dir / f"chapter{row['chapter_number']:02d}.jpg"
     start = row["start_ms"] / 1000
     duration = row["duration_ms"] / 1000
+    # Deinterlace with the disc's actual field order (mo1 is TFF; the rest BFF).
+    parity = row["field_order"] if row["field_order"] in ("tff", "bff") else "bff"
+    deint_filter = f"bwdif=mode=send_frame:parity={parity},scale=640:480:flags=lanczos,setsar=1"
     source_mounts, container_source = _container_media_path(settings, source)
     data_mount = ["-v", f"{settings.data_dir}:/data:rw"]
     proxy_partial = proxy.with_suffix(".partial.mp4")
@@ -402,8 +405,7 @@ def _generate_chapter_media(settings: Settings, row: object, *, force: bool) -> 
                     "--entrypoint", "ffmpeg", settings.ffmpeg_image,
                     "-hide_banner", "-loglevel", "warning", "-y",
                     "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", container_source,
-                    "-map", "0:v:0", "-map", "0:a:0?", "-vf",
-                    "bwdif=mode=send_frame:parity=bff,scale=640:480:flags=lanczos,setsar=1",
+                    "-map", "0:v:0", "-map", "0:a:0?", "-vf", deint_filter,
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
                     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                     "-c:a", "aac", "-b:a", "96k", "-ac", "2",
@@ -421,7 +423,7 @@ def _generate_chapter_media(settings: Settings, row: object, *, force: bool) -> 
                     "--entrypoint", "ffmpeg", settings.ffmpeg_image,
                     "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{thumb_at:.3f}",
                     "-i", container_source, "-map", "0:v:0", "-frames:v", "1",
-                    "-vf", "bwdif=mode=send_frame:parity=bff,scale=640:480:flags=lanczos,setsar=1",
+                    "-vf", deint_filter,
                     f"/data/{thumb_partial.relative_to(settings.data_dir)}",
                 ]
             )
@@ -456,6 +458,100 @@ def _generate_chapter_media(settings: Settings, row: object, *, force: bool) -> 
         raise
 
 
+def _generate_restored_proxy(settings: Settings, row: object, *, force: bool) -> None:
+    source = settings.data_dir / row["output_path"]
+    if not source.is_file():
+        raise ScanError(f"Restored output missing on disk: {row['output_path']}")
+    output_dir = settings.data_dir / "review" / row["disc_slug"] / f"title{row['title_number']:02d}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    proxy = output_dir / f"chapter{row['chapter_number']:02d}.restored.mp4"
+    partial = proxy.with_suffix(".partial.mp4")
+    if force or not proxy.is_file():
+        partial.unlink(missing_ok=True)
+        # The restored masters are ~45 Mbps HEVC 10-bit MKVs — transcode to a
+        # browser-safe H.264 MP4 at native resolution so the library player can
+        # stream the actual restoration quality. --cpu-shares makes this yield
+        # to a concurrently running restoration pipeline's own ffmpeg stages.
+        _run(
+            [
+                "docker", "run", "--rm", "--network", "none", "--cpu-shares", "512",
+                "-v", f"{settings.data_dir}:/data:rw",
+                "--entrypoint", "ffmpeg", settings.ffmpeg_image,
+                "-hide_banner", "-loglevel", "warning", "-y",
+                "-i", f"/data/{row['output_path']}",
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-maxrate", "12M", "-bufsize", "24M",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+                f"/data/{partial.relative_to(settings.data_dir)}",
+            ],
+            capture=False,
+        )
+        os.replace(partial, proxy)
+    media = _ffprobe(settings, proxy)
+    video = next((s for s in media.get("streams", []) if s.get("codec_type") == "video"), None)
+    if not video or video.get("codec_name") != "h264":
+        raise ScanError("Restored proxy validation failed: H.264 video stream missing")
+    _register_artifact(
+        settings, title_id=row["title_id"], chapter_id=row["chapter_id"],
+        kind="restored_proxy", path=proxy, mime_type="video/mp4",
+        duration_ms=row["duration_ms"], media=media,
+    )
+
+
+def generate_restored_proxies(
+    settings: Settings | None = None,
+    *,
+    disc_slug: str | None = None,
+    limit: int | None = None,
+    force: bool = False,
+) -> int:
+    """Browser proxies of completed chapter restorations (latest job per chapter)."""
+    settings = settings or load_settings()
+    migrate(settings.database_path)
+    params: list[object] = []
+    where = "WHERE j.target_type='chapter' AND j.state='completed'"
+    if disc_slug:
+        known_slugs = {spec.slug for spec in settings.disc_specs}
+        if disc_slug not in known_slugs:
+            raise ScanError(f"Unknown disc slug {disc_slug!r}; known: {sorted(known_slugs)}")
+        where += " AND d.slug=?"
+        params.append(disc_slug)
+    query = f"""SELECT j.id AS job_id, c.id AS chapter_id, c.chapter_number, c.duration_ms,
+                       c.title_id, t.title_number, d.slug AS disc_slug,
+                       a.relative_path AS output_path
+                FROM jobs j
+                JOIN chapters c ON c.id=j.target_id
+                JOIN titles t ON t.id=c.title_id
+                JOIN discs d ON d.id=t.disc_id
+                JOIN artifacts a ON a.job_id=j.id AND a.kind='restored_output'
+                     AND a.validation_state='valid'
+                {where} ORDER BY j.id DESC"""
+    with connect(settings.database_path) as db:
+        rows = list(db.execute(query, params))
+        done = {
+            r[0] for r in db.execute(
+                "SELECT chapter_id FROM artifacts WHERE kind='restored_proxy' AND chapter_id IS NOT NULL"
+            )
+        }
+    seen: set[int] = set()
+    pending = []
+    for row in rows:
+        if row["chapter_id"] in seen:
+            continue  # an older re-run of the same chapter; the newest job wins
+        seen.add(row["chapter_id"])
+        if not force and row["chapter_id"] in done:
+            continue
+        pending.append(row)
+    if limit is not None:
+        pending = pending[: max(0, limit)]
+    for row in pending:
+        print(f"Restored proxy: {row['disc_slug']} title {row['title_number']} chapter {row['chapter_number']}…")
+        _generate_restored_proxy(settings, row, force=force)
+    return len(pending)
+
+
 def generate_review_media(
     settings: Settings | None = None,
     *,
@@ -474,7 +570,8 @@ def generate_review_media(
         where += " AND d.slug=?"
         params.append(disc_slug)
     query = f"""SELECT c.id AS chapter_id, c.title_id, c.chapter_number,
-                       c.start_ms, c.duration_ms, t.title_number, d.slug AS disc_slug
+                       c.start_ms, c.duration_ms, t.title_number, d.slug AS disc_slug,
+                       d.field_order
                 FROM chapters c
                 JOIN titles t ON t.id=c.title_id JOIN discs d ON d.id=t.disc_id
                 {where} ORDER BY d.id, t.title_number, c.chapter_number"""
@@ -492,12 +589,16 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Scan fixed wedding DVD ISOs and create review media")
     parser.add_argument("--scan", action="store_true", help="scan all staged ISOs in source/")
     parser.add_argument("--proxies", action="store_true", help="generate chapter proxies and thumbnails")
+    parser.add_argument(
+        "--restored-proxies", action="store_true",
+        help="generate browser proxies of completed chapter restorations",
+    )
     parser.add_argument("--disc", help="limit proxy generation to one disc slug (e.g. gulfraz1)")
     parser.add_argument("--limit", type=int, help="limit proxy count for a verification run")
     parser.add_argument("--force", action="store_true", help="regenerate existing review media")
     args = parser.parse_args(argv)
-    if not args.scan and not args.proxies:
-        parser.error("choose --scan and/or --proxies")
+    if not args.scan and not args.proxies and not args.restored_proxies:
+        parser.error("choose --scan, --proxies and/or --restored-proxies")
     settings = load_settings()
     if args.scan:
         ids = scan_all_discs(settings)
@@ -505,6 +606,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.proxies:
         count = generate_review_media(settings, disc_slug=args.disc, limit=args.limit, force=args.force)
         print(f"Generated or validated {count} chapter proxy set(s)")
+    if args.restored_proxies:
+        count = generate_restored_proxies(settings, disc_slug=args.disc, limit=args.limit, force=args.force)
+        print(f"Generated {count} restored chapter prox(ies)")
 
 
 if __name__ == "__main__":

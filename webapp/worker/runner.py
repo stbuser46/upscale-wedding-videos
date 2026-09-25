@@ -128,10 +128,10 @@ def _heartbeat(
     started: bool = False,
 ) -> None:
     def op() -> None:
-        # Local worker owns row 1 (as always); cloud workers own row 2 —
-        # concurrent workers previously clobbered one shared row, making the
-        # UI's worker pill and heartbeat-derived numbers ambiguous
-        # ("needs fixing.md" item 4). Row 2 is created on first use.
+        # Local worker owns row 1, cloud workers own row 2 (migration 009
+        # permits id IN (1,2) — the original CHECK(id=1) silently rejected every
+        # cloud heartbeat). Concurrent workers previously clobbered one shared
+        # row; per-role rows keep each health signal independent.
         row_id = 2 if _cloud_enabled() else 1
         with connect(settings.database_path) as db:
             now = utc_now()
@@ -1255,6 +1255,10 @@ def _cloud_fleet_config(settings: Settings):
         max_tree_upload_s=float(os.environ.get("WEDDING_CLOUD_MAX_TREE_S", "60")),
         provision_dir=provision_dir,
         inductor_cache=cache if cache.is_dir() else None,
+        # Ship pod_engine.py during provisioning ONLY when this worker will
+        # actually use it — gate-off provisioning stays byte-identical to the
+        # classic path (Codex round-3 finding #7).
+        pod_engine=os.environ.get("WEDDING_POD_ENGINE") == "1",
     )
 
 
@@ -1623,6 +1627,26 @@ def _run_units_cloud(settings: Settings, job) -> int:
             # clock so time spent queued (e.g. during a long stage-1 prepare)
             # can't get a healthy pod killed mid-first-unit (finding A2).
             slot.created_at = time.monotonic()
+            # Warm-worker engine (opt-in, WEDDING_POD_ENGINE=1): one resident
+            # SeedVR2 process per pod, so the model loads ONCE and every later
+            # unit skips the 2-4 min per-unit reload. Spawning is non-blocking
+            # (ssh + imports run in the background); the READY wait happens on
+            # the first restore. Any engine trouble falls back to the classic
+            # one-shot path below — with the gate off, engine stays None and
+            # the dispatch is byte-identical to today.
+            engine = None
+            if os.environ.get("WEDDING_POD_ENGINE") == "1":
+                try:
+                    engine = cloud_exec.PodEngine(
+                        cloud_exec.pod_engine_command(slot.endpoint, cfg.ssh_key),
+                        name=f"{slot.endpoint[0]}:{slot.endpoint[1]}",
+                        remote_killer=cloud_exec.pod_engine_remote_killer(
+                            slot.endpoint, cfg.ssh_key))
+                    engine.start()
+                except Exception as exc:  # engine is an optimization, never a blocker
+                    print(f"[dispatch] warm engine unavailable on {slot.pod_id}: "
+                          f"{str(exc)[:120]}; using one-shot restores", flush=True)
+                    engine = None
             pod_bad = _threading.Event()
             # Transfer failures get TWO strikes before the pod is condemned:
             # one blip is as likely the home link or a rate-limited route as
@@ -1714,12 +1738,86 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     pre = _threading.Thread(target=prefetch, daemon=True,
                                             name=f"prefetch-{idx}")
                     pre.start()
-                    rres = cloud_exec.restore_unit(
-                        slot.endpoint, cfg.ssh_key,
-                        slice_name=f"unit_{seq:05d}.mkv", out_name=f"unit_{seq:05d}.mkv",
-                        unit=current, model=model, resolution=resolution,
-                        batch=batch, overlap=overlap, log_path=log,
-                        should_abort=lambda: hard_stop() is not None)
+                    # One wall-clock budget per unit (deadline parity, Codex
+                    # round-3 finding #5): the engine attempt and any classic
+                    # fallback SHARE it, so an engine stall can no longer
+                    # double a unit's worst-case time. 3600.0 is restore_unit's
+                    # own default, so the no-engine path is unchanged.
+                    unit_budget_s = 3600.0
+                    fallback_budget_s = unit_budget_s
+                    rres = None
+                    if engine is not None and engine.alive:
+                        # The ENTIRE engine path is exception-proofed (Codex
+                        # round-3 finding #2): an escape here must not skip the
+                        # classic fallback, orphan the prefetched unit, or
+                        # retire a healthy slot without replacement.
+                        t_engine0 = time.monotonic()
+                        try:
+                            rres = cloud_exec.restore_unit_via_engine(
+                                engine,
+                                slice_name=f"unit_{seq:05d}.mkv", out_name=f"unit_{seq:05d}.mkv",
+                                unit=current, model=model, resolution=resolution,
+                                batch=batch, overlap=overlap, log_path=log,
+                                should_abort=lambda: hard_stop() is not None,
+                                max_run_s=unit_budget_s)
+                        except Exception as exc:
+                            # The kill barrier must still run: the exception
+                            # may have escaped BEFORE restore_unit_via_engine
+                            # ran its own barrier (e.g. the log open failed).
+                            verified = False
+                            try:
+                                verified = engine.shutdown_barrier()
+                            except Exception:
+                                pass
+                            rres = cloud_exec.UnitResult(
+                                status=1 if verified else cloud_exec.STATUS_ENGINE_UNVERIFIED,
+                                message=f"engine path raised {type(exc).__name__}: "
+                                        f"{str(exc)[:160]}")
+                        if rres.status not in (0, -1):
+                            # Engine-layer failure (death, stall, ERR reply,
+                            # exception): close the engine. If the remote side
+                            # is PROVEN dead, re-run this SAME unit via the
+                            # classic one-shot path — the classic verdict, not
+                            # the engine's, decides the unit's and the pod's
+                            # fate, so an engine bug can never strike a healthy
+                            # pod or burn a unit attempt on its own.
+                            print(f"[dispatch] warm engine failed on {slot.pod_id} "
+                                  f"(unit {seq}: {rres.message}); "
+                                  + ("falling back to one-shot restore"
+                                     if rres.status != cloud_exec.STATUS_ENGINE_UNVERIFIED
+                                     else "requeueing unit and retiring pod"),
+                                  flush=True)
+                            engine.close()
+                            engine = None
+                            if rres.status == cloud_exec.STATUS_ENGINE_UNVERIFIED:
+                                # Kill barrier failed: a zombie remote restore
+                                # may still hold this GPU/output path. NEVER
+                                # run the fallback here — requeue the unit for
+                                # another pod (no attempt burned; the engine's
+                                # verdict is not authoritative) and condemn
+                                # this pod so it retires and is replaced.
+                                pre.join()
+                                nxt = nxt_box.get("unit")
+                                if nxt is not None:
+                                    requeue_quietly(nxt)
+                                requeue_quietly(current)
+                                current = None
+                                pod_bad.set()
+                                break
+                            # Fallback gets only what is LEFT of the unit's
+                            # budget (with a 10-min floor so a near-expired
+                            # budget still allows a real attempt).
+                            fallback_budget_s = max(
+                                600.0, unit_budget_s - (time.monotonic() - t_engine0))
+                            rres = None
+                    if rres is None:
+                        rres = cloud_exec.restore_unit(
+                            slot.endpoint, cfg.ssh_key,
+                            slice_name=f"unit_{seq:05d}.mkv", out_name=f"unit_{seq:05d}.mkv",
+                            unit=current, model=model, resolution=resolution,
+                            batch=batch, overlap=overlap, log_path=log,
+                            should_abort=lambda: hard_stop() is not None,
+                            max_run_s=fallback_budget_s)
                     pre.join()
                     nxt = nxt_box.get("unit")
                     if rres.status == -1:  # aborted (stop requested)
@@ -1741,6 +1839,10 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     finalizers.append(fin)
                     current = nxt
             finally:
+                # The resident engine dies with its pod: EXIT + terminate
+                # (idempotent, never raises) BEFORE the pod is retired.
+                if engine is not None:
+                    engine.close()
                 # Idempotent safety net: whatever exited this loop — including
                 # an unexpected exception mid-body — the popped unit must not
                 # stay open forever (Codex round-2 finding #1). If it was

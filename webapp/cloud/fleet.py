@@ -64,6 +64,10 @@ class FleetConfig:
     ssh_key: Path = DEFAULT_SSH_KEY
     provision_dir: Path = field(default=None)   # local docker/seedvr2-pod dir
     inductor_cache: Path = field(default=None)  # local warm cache to upload
+    pod_engine: bool = False                    # ship pod_engine.py at provisioning
+                                                # (set from WEDDING_POD_ENGINE=1; the
+                                                # gate-off path must provision
+                                                # byte-identically to baseline)
 
 
 class CloudFleet:
@@ -262,10 +266,18 @@ class CloudFleet:
         """A working pod died with units still queued: bring up a replacement
         so fleet capacity recovers instead of only ever shrinking (the
         2026-09-24 run decayed 6→2 pods and had to be manually restarted).
-        Bounded by max_slots total replacements, the spend cap, and the usual
-        bring-up guards."""
+        Bounded so that LIVE + in-flight pods never exceed max_slots (Codex
+        round-4 finding #4: bounding only the replacement *count* let 8 initial
+        + N hot-adds reach 2×max_slots), plus a cumulative replacement ceiling,
+        the spend cap, and the usual bring-up guards."""
         with self._lock:
             if self._stop.is_set() or self._no_more_work.is_set():
+                return
+            live = len(self._slots)
+            in_flight = sum(1 for t in self._threads if t.is_alive())
+            if live + in_flight >= self.cfg.max_slots:
+                self.log(f"[fleet] at capacity ({live} live + {in_flight} in-flight "
+                         f">= max_slots {self.cfg.max_slots}); not adding a pod")
                 return
             if getattr(self, "_replacements", 0) >= self.cfg.max_slots:
                 self.log("[fleet] replacement budget exhausted; not replacing pod")
@@ -815,6 +827,14 @@ class CloudFleet:
                 f"(> {cfg.max_tree_upload_s:.0f}s) — host route too slow, refusing pod")
         for f in ("requirements-pod.txt", "provision_pod.sh"):
             rsync(endpoint, pdir / f, f"/workspace/provision/{f}", upload=True, ssh_key=cfg.ssh_key)
+        # Warm-worker engine: ship pod_engine.py ONLY when this worker was
+        # started with WEDDING_POD_ENGINE=1 (plumbed via cfg.pod_engine). With
+        # the gate off, provisioning is byte-identical to the classic path —
+        # no extra fallible transfer can reject a pod the baseline would have
+        # accepted (Codex round-3 finding #7).
+        if cfg.pod_engine:
+            rsync(endpoint, pdir / "pod_engine.py", "/opt/SeedVR2/pod_engine.py",
+                  upload=True, ssh_key=cfg.ssh_key)
 
         self._enable_peer_access(endpoint)
         self._ensure_cache_on_pod(endpoint, index, step)

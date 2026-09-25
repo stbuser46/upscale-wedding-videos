@@ -1,5 +1,113 @@
 # Needs fixing
 
+## Codex round-4 pre-commit review (2026-09-25) — triage
+
+**Fixed before commit:**
+- **#6 cloud heartbeat CHECK violation** — `worker_status` had `CHECK(id=1)`, so
+  the cloud worker's id=2 heartbeats silently failed (no cloud health signal).
+  Migration `009_worker_status_multi.sql` now permits id IN (1,2). Server views
+  still read id=1 (local) — surfacing the cloud row (id=2) is a small UI-session
+  follow-up.
+- **#4 hot-add overshoot** — `request_replacement` now bounds by
+  `live + in-flight < max_slots` (was bounding replacement *count* only, which
+  let 8 initial + N hot-adds reach ~2×max_slots).
+
+**Accepted / deferred (backstopped, not regressions from today's diff):**
+- **#1 unconfirmed-create rows can close without provider proof; #2 a pricing
+  API failure lets a pod accrue $0.** Both are money-edge cases already present
+  in committed `0f953f4`; they did NOT leak in a full paid day (verified
+  `our_pods()` == billing repeatedly). Backstops: the age-filtered reaper timer
+  and a **RunPod account-level spend limit (set this in the RunPod console —
+  the final guard).** Proper fix: unique per-attempt pod names + never close a
+  pid-less row without a successful provider listing/delete; fail closed on
+  unknown price. Do before large unattended fan-outs.
+- **#3 settle/requeue not atomic** — a unit is removed from `open_units` before
+  its requeue/DB write commits; a race window could let `drained()` fire and
+  strand a tail retry. Fails RESUMABLY (no money/quality loss — resume re-runs
+  it). Fix: one locked open→queued/terminal transition (or a `settling` state
+  that still blocks `drained()`).
+- **#7 ETA cold-start** doesn't pass `parallelism` on the very first estimate;
+  windowed-fps denominator starts at first completion (overstates early). Cosmetic.
+- **#8 restored-proxy staleness** — an existing `restored_proxy` row skips a
+  newer restoration; verify file existence/freshness (`catalog.py`).
+
+**Verified safe by Codex:** the `apad` mux fix (cannot truncate video, doesn't
+bloat audio, video stream-copy unchanged); the warm engine is fully inert with
+`WEDDING_POD_ENGINE` unset.
+
+
+
+> **Warm-worker canary verdict (2026-09-25, ~$5.4 of pod time):** the paid
+> identity program ran on a real RTX PRO 6000. Results:
+> - Mechanics PROVEN: one resident process served all requests; upstream logs
+>   confirm DiT+VAE reuse; request #2 ran **37% faster** (433 s vs 688 s on
+>   the tail shape). First canary attempt also caught a real launch bug
+>   (`setsid` without `--wait` orphaned the engine at stdin EOF — fixed).
+> - Quality gate **FAILED — WEDDING_POD_ENGINE stays OFF**: decoded hashes
+>   differ one-shot-vs-engine on BOTH shapes, including the engine's FIRST
+>   request (fresh process), so the divergence is cache-mode code paths
+>   (offload defaults etc. — Codex round-3 finding #4 confirmed), not
+>   residual state.
+> - **The cloud one-shot path is bit-DETERMINISTIC** (identical re-run hash
+>   `5119c9…`), so production output is reproducible and bit-identity remains
+>   the right acceptance bar.
+> **Next step for whoever resumes this:** align the engine's effective
+> execution parameters with one-shot mode (start with
+> `_parse_offload_device`'s cache_enabled flip: pin
+> `--vae_offload_device`/`--dit_offload_device` explicitly in engine argv;
+> diff the full effective args/branches), then re-canary (~$1.5). The
+> reuse machinery itself needs no further work.
+
+## QUEUED NEXT (user-approved 2026-09-24): warm-worker engine, after disc 1
+
+Keep cloud GPUs busy ~95%+ by eliminating the two remaining engine-internal
+idle windows (currently ~15-20% of paid pod time):
+
+1. **Persistent pod-side engine process** (the big one, ~10-15% throughput):
+   **IMPLEMENTED behind `WEDDING_POD_ENGINE=1` (2026-09-24), Codex round-3
+   adversarial findings all fixed (2026-09-25), awaiting the paid identity
+   canary — keep the gate OFF until it passes.**
+   `docker/seedvr2-pod/pod_engine.py` (resident service, line protocol over
+   one persistent ssh) + `PodEngine`/`restore_unit_via_engine` in
+   `webapp/cloud/executor.py` + dispatcher wiring in `runner.py::pod_runner`
+   (engine created per pod slot, closed in the runner's `finally`; ANY
+   engine-layer failure falls back to the classic one-shot `restore_unit` for
+   that unit WITHOUT striking the pod — the classic verdict decides). The
+   engine file rides `fleet._provision_pod` ONLY when the worker runs with
+   `WEDDING_POD_ENGINE=1` (plumbed via `FleetConfig.pod_engine`) and the pod
+   image (`COPY` in `docker/seedvr2-pod/Dockerfile`). With the gate off,
+   dispatch AND provisioning are byte-identical to the one-ssh-per-unit path
+   (mock-verified).
+   **Codex round-3 fixes (2026-09-25):** (1) remote kill barrier — the engine
+   runs under `setsid`, reports its pid/PGID at READY, and every abnormal end
+   ssh-kills the whole remote group and VERIFIES death before any fallback;
+   unverifiable death = status 3 → requeue elsewhere (no attempt burned) +
+   retire the pod; (2) the dispatcher's engine path is fully
+   exception-proofed (try/except → barrier → classic fallback); (3+4) the
+   identity canary now primes with a full-size slice A and compares one-shot
+   vs engine for BOTH A and a different-content tail-shaped B, with unique
+   output names and a same-remote-pid persistence proof — and must be
+   repeated per GPU class; (5) deadline parity — engine attempt + classic
+   fallback share ONE 3600 s unit budget (600 s fallback floor); (6) engine
+   log persistence moved to a bounded drop-oldest writer thread so a blocked
+   log filesystem can never stop abort/stall/timeout enforcement; (7)
+   gate-off provisioning no longer ships pod_engine.py; (8) the engine forces
+   `--cache_dit` (engine-only) so the DiT is actually resident, with timing +
+   "reusing cached" log evidence surfaced by the canary.
+   Covered by `webapp/cloud/test_pod_engine.py` (19 real-subprocess protocol/
+   barrier/log-writer tests against `webapp/cloud/fake_pod_engine.py`), 5
+   engine-mode dispatch tests, and a provisioning-gate test — full suite 46
+   green.
+   **Acceptance gate before enabling:** run
+   `scripts/test_pod_engine_identity.py` against a paid canary pod PER GPU
+   CLASS the fleet may rent — it must print PASS (one-shot vs engine
+   decoded-framemd5-sha256 identical for both the full-size A and tail-shaped
+   B requests, one persistent engine pid). Never run automatically.
+   Local-path benefit (same per-unit reload there) remains future work.
+2. **Async HEVC writer** (secondary, ~30-60 s/unit): upstream engine patch,
+   classified bit-identical by docs/PERF_STUDY_CODEX.md — write chunk N while
+   the GPU starts N+1.
+
 > **Status update (2026-09-24, late evening — main session):**
 > - **Item 1 (cloud ETA): FIXED in `runner.py`** — planning fallback now scales
 >   by ready-pod count, ETA prefers windowed throughput over recent validated

@@ -52,7 +52,10 @@ function discCard(disc, payload, index) {
   const card = el("article", "disc-card");
   const header = el("div", "disc-card-header");
   const heading = el("div");
-  heading.append(el("p", "eyebrow", disc.slug.toUpperCase()), el("h2", "", disc.label || disc.source_filename));
+  // The DVD volume label is usually a meaningless "VIDEO_DVD" shared by every
+  // disc — identify the card by its collection + disc number instead.
+  const discName = disc.collection ? `${disc.collection} — Disc ${index}` : (disc.label || disc.source_filename);
+  heading.append(el("p", "eyebrow", disc.slug.toUpperCase()), el("h2", "", discName));
   heading.append(el("span", `status ${disc.scan_status === "failed" ? "failed" : ""}`, disc.scan_status));
   header.append(heading, el("span", "disc-number", String(index).padStart(2, "0")));
   const stats = el("div", "disc-stats");
@@ -149,16 +152,30 @@ function chapterCard(chapter, selectionChanged) {
   const checkbox = el("input", "select-check"); checkbox.type = "checkbox"; checkbox.ariaLabel = `Select chapter ${chapter.chapter_number}`;
   checkbox.addEventListener("change", () => { card.classList.toggle("selected", checkbox.checked); selectionChanged(); });
   thumb.append(checkbox);
-  if (chapter.proxy_artifact_id) {
-    const play = el("button", "play-button", "▶"); play.type = "button"; play.ariaLabel = `Play chapter ${chapter.chapter_number}`;
-    play.addEventListener("click", () => {
-      const video = document.getElementById("chapter-player");
-      video.src = `/media/${chapter.proxy_artifact_id}`; video.classList.add("visible");
-      document.getElementById("player-empty").classList.add("hidden");
-      document.getElementById("now-playing").textContent = chapter.user_label || chapter.generated_label;
-      video.play(); document.querySelector(".player-panel").scrollIntoView({behavior: "smooth", block: "center"});
-    });
+  const playArtifact = (artifactId, version) => {
+    const video = document.getElementById("chapter-player");
+    video.src = `/media/${artifactId}`; video.classList.add("visible");
+    document.getElementById("player-empty").classList.add("hidden");
+    document.getElementById("now-playing").textContent = `${chapter.user_label || chapter.generated_label} — ${version}`;
+    video.play(); document.querySelector(".player-panel").scrollIntoView({behavior: "smooth", block: "center"});
+  };
+  // Restored chapters play the restored HD proxy by default; the untouched
+  // DVD-quality proxy stays one click away for before/after comparison.
+  const restoredId = chapter.restored_proxy_artifact_id;
+  const originalId = chapter.proxy_artifact_id;
+  if (restoredId || originalId) {
+    const play = el("button", "play-button", "▶"); play.type = "button";
+    play.ariaLabel = `Play chapter ${chapter.chapter_number}${restoredId ? " (restored)" : ""}`;
+    play.title = restoredId ? "Play restored HD" : "Play original";
+    play.addEventListener("click", () => playArtifact(restoredId || originalId, restoredId ? "restored HD" : "original"));
     thumb.append(play);
+  }
+  if (restoredId && originalId) {
+    const orig = el("button", "play-button play-original", "original"); orig.type = "button";
+    orig.ariaLabel = `Play chapter ${chapter.chapter_number} original`;
+    orig.title = "Play the untouched DVD-quality proxy";
+    orig.addEventListener("click", () => playArtifact(originalId, "original"));
+    thumb.append(orig);
   }
   const content = el("div", "chapter-content");
   // ~55 GPU-minutes per footage-minute on the local pipeline (VAE-compile path).
@@ -188,7 +205,7 @@ async function loadTitle() {
     const payload = await api(`/api/titles/${titleId}/chapters`);
     const title = payload.title;
     document.getElementById("title-kicker").textContent = `${title.disc_slug.toUpperCase()} · DVD title ${String(title.title_number).padStart(2,"0")}`;
-    document.getElementById("title-name").textContent = `${title.disc_label} — Title ${title.title_number}`;
+    document.getElementById("title-name").textContent = `${title.disc_collection || title.disc_label} — Title ${title.title_number}`;
     const restoredCount = payload.chapters.filter(ch => ch.restoration?.restored).length;
     document.getElementById("title-meta").textContent = `${formatTime(title.duration_ms)} · ${payload.chapters.length} chapters · ${restoredCount}/${payload.chapters.length} restored · ${title.video.format} ${title.video.width}×${title.video.height} · ${title.video.aspect}`;
     const grid = document.getElementById("chapters"); const queueButton = document.getElementById("queue-selected"); const count = document.getElementById("selected-count");

@@ -211,7 +211,8 @@ def disc_titles(disc_id: int):
 def title_chapters(title_id: int):
     with _db() as db:
         title = db.execute(
-            """SELECT t.*, d.slug AS disc_slug, d.label AS disc_label
+            """SELECT t.*, d.slug AS disc_slug, d.label AS disc_label,
+                      d.collection AS disc_collection
                FROM titles t JOIN discs d ON d.id=t.disc_id WHERE t.id=?""",
             (title_id,),
         ).fetchone()
@@ -220,9 +221,11 @@ def title_chapters(title_id: int):
         rows = db.execute(
             """SELECT c.*,
                       p.id AS proxy_artifact_id, p.relative_path AS proxy_path,
+                      rp.id AS restored_proxy_artifact_id,
                       th.id AS thumbnail_artifact_id, th.relative_path AS thumbnail_path
                FROM chapters c
                LEFT JOIN artifacts p ON p.chapter_id=c.id AND p.kind='chapter_proxy'
+               LEFT JOIN artifacts rp ON rp.chapter_id=c.id AND rp.kind='restored_proxy'
                LEFT JOIN artifacts th ON th.chapter_id=c.id AND th.kind='thumbnail'
                WHERE c.title_id=? ORDER BY c.chapter_number""",
             (title_id,),

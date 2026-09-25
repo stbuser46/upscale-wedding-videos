@@ -24,7 +24,7 @@ CTX=$(mktemp -d /tmp/seedvr2-pod-ctx.XXXXXX)
 cleanup() { rm -rf "$CTX"; }
 trap cleanup EXIT
 
-cp "$HERE/Dockerfile" "$HERE/pod_start.sh" "$HERE/pod_provision.sh" "$CTX/"
+cp "$HERE/Dockerfile" "$HERE/pod_start.sh" "$HERE/pod_provision.sh" "$HERE/pod_engine.py" "$CTX/"
 
 mkdir -p "$CTX/inductor_cache"
 if [[ -d "$CACHE_SRC" ]]; then

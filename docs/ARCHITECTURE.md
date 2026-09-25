@@ -172,6 +172,38 @@ instead of billing them through transfers:
   decoded-identity proof, cross-build-verified. Any failure or mismatch falls
   back to the per-unit home upload, so the peer path can only ever ship
   proven-identical bytes and can never be slower than the old design.
+- **Round-3 hardening (2026-09-25), from a full paid disc-1 cloud run + two more Codex passes:**
+  per-attempt ledger rows (never reuse a name-keyed row across create attempts);
+  `terminate_all` kills every pod provider-side FIRST, then does best-effort
+  ledger bookkeeping, with a delayed second sweep for in-flight creates;
+  spend-cap watchdog fails CLOSED (3 failed spend queries → teardown) and
+  tolerates naive timestamps; ingress gate on the 6 MB tree upload (serialized
+  probes) refuses hopeless-route hosts before provisioning; automatic pod
+  replacement + operator hot-add (`echo N > <work>/add_pods`, bounded by
+  `max_slots`); sibling-pod `relay_download` rescues a finished unit when the
+  home route to its pod is blocked; unconfirmed-create rows stay `terminating`
+  and are closed only once the provider verifiably lacks the pod; per-job peer
+  keypairs so concurrent workers can't clobber each other; lease-aware
+  `_reconcile_cloud_pods` (a second cloud worker never terminates a live-leased
+  job's pods — proven in production when a finalize worker ran beside the disc-2
+  fleet). ETAs are honest now (fallback scales by ready-pod count, throughput is
+  a 40-min window not a stall-polluted run average, countdown freezes when frames
+  stop). Worker heartbeats use per-role rows (local=1, cloud=2).
+- **Assembly frame-preservation fix (2026-09-25):** the FLAC mux in both
+  `assemble_units.sh` and `pipeline_v3.sh` now appends `apad` before `-shortest`.
+  Without it, a trimmed audio track a few samples shorter than the concatenated
+  video let `-shortest` clip video frames off the tail (disc-1 Segment 16 lost 9
+  frames → strict frame-count validation failed on otherwise-perfect footage).
+  `apad` pads audio so `-shortest` can only ever trim audio down to the video —
+  video frames are never lost. Verified on Segment 16's real units: 34331 → 34340.
+- **Warm-worker engine (`docker/seedvr2-pod/pod_engine.py`, GATED OFF):** a
+  resident per-pod SeedVR2 service to skip the ~2-4 min per-unit model reload.
+  Built, Codex-reviewed, 46-test covered, and taken to a PAID identity canary:
+  the mechanics work (one resident process, DiT+VAE reuse, request #2 ~37%
+  faster) but decoded output DIFFERS from the one-shot path (cache-mode code
+  branches), so `WEDDING_POD_ENGINE` stays OFF pending a parameter-alignment fix
+  and a re-canary. The cloud one-shot path was proven bit-DETERMINISTIC, so
+  bit-identity remains the acceptance bar. See `needs fixing.md`.
 - **No unowned billing:** when the unit queue drains, runners call
   `fleet.mark_no_more_work()` — unclaimed pods in the slot queue are retired
   immediately, a pod that goes READY later is retired on arrival, and pending

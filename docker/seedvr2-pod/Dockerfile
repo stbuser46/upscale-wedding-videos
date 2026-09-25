@@ -38,6 +38,15 @@ ENV TORCHINDUCTOR_CACHE_DIR=/opt/inductor_cache \
 COPY pod_start.sh pod_provision.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/pod_start.sh /usr/local/bin/pod_provision.sh
 
+# Resident warm-worker engine (WEDDING_POD_ENGINE=1): loads the model once and
+# restores unit after unit over one persistent ssh session. Lives inside the
+# SeedVR2 tree (it imports inference_cli from its own directory). When — and
+# only when — a worker runs with the gate on, the fleet also rsyncs the repo
+# copy at provision time (FleetConfig.pod_engine), so stock-base pods get it
+# too and an updated engine never waits on an image rebuild; gate-off
+# provisioning ships nothing extra.
+COPY pod_engine.py /opt/SeedVR2/pod_engine.py
+
 # The base image's ENTRYPOINT is the inference CLI itself. A pod must instead
 # come up as a long-lived ssh host. RunPod overrides ENTRYPOINT in some paths,
 # so the orchestrator also passes dockerEntrypoint/dockerStartCmd explicitly.
