@@ -114,9 +114,26 @@ def system_metrics():
 
 @api.get("/worker/health")
 def worker_health():
+    """Health of the most-alive worker. Two workers share the table since the
+    009 migration (row 1 = local GPU, row 2 = cloud dispatcher); the header
+    pill used to read only row 1, so a stopped local worker showed 'worker
+    stopped' while the cloud worker was busy restoring (observed live
+    2026-09-25). Prefer an alive row — freshest heartbeat wins — and fall
+    back to row 1's historical behaviour when nothing is alive."""
     with _db() as db:
-        row = db.execute("SELECT * FROM worker_status WHERE id=1").fetchone()
-    return jsonify(_worker_health_dict(row))
+        rows = db.execute("SELECT * FROM worker_status ORDER BY id").fetchall()
+    candidates = [_worker_health_dict(r) for r in rows]
+    alive = [c for c in candidates if c.get("alive")]
+    if alive:
+        chosen = max(alive, key=lambda c: c.get("last_beat_at") or "")
+    else:
+        chosen = candidates[0] if candidates else _worker_health_dict(None)
+    chosen["workers"] = [
+        {"id": c.get("id"), "activity": c.get("activity"), "alive": c.get("alive"),
+         "detail": c.get("detail"), "last_beat_at": c.get("last_beat_at")}
+        for c in candidates
+    ]
+    return jsonify(chosen)
 
 
 def _parse_ts(value) -> datetime | None:
