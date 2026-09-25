@@ -1609,6 +1609,83 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 unit=unit, log_path=log,
                 should_abort=lambda: hard_stop() is not None)
 
+        def run_shadow_unit(slot, unit) -> None:
+            """Straggler duplication (2026-09-25 throughput review): the
+            standby pod redundantly restores the LAST in-flight unit instead
+            of idling beside it — the segment's wall clock ends on the slowest
+            pod's last unit, and the standby is already paid for.
+
+            First valid result wins through the same exactly-once _settle
+            everyone else uses. The shadow can only ever ADD a success: every
+            shadow failure is silent — no transfer strikes, no requeue, no
+            attempt charged, no unit_failed — because the primary attempt is
+            still running and owns the unit's fate. It downloads to a shadow
+            path so a losing transfer can never touch (or corrupt) the
+            winner's committed file, and aborts itself the moment the unit
+            resolves elsewhere. Deliberately spends bounded extra GPU time
+            (at most one unit's worth) to cut the tail."""
+            seq = unit["seq"]
+
+            def resolved() -> bool:
+                with state_lock:
+                    return seq not in open_units
+
+            spath = slices_dir / f"unit_{seq:05d}.mkv"
+            if not spath.is_file():
+                return  # slice already cleaned up; nothing safe to duplicate
+            up = deliver_slice(slot, unit)
+            if up.status != 0 or resolved():
+                return
+            rres = cloud_exec.restore_unit(
+                slot.endpoint, cfg.ssh_key,
+                slice_name=f"unit_{seq:05d}.mkv", out_name=f"unit_{seq:05d}.mkv",
+                unit=unit, model=model, resolution=resolution,
+                batch=batch, overlap=overlap, log_path=log,
+                should_abort=lambda: hard_stop() is not None or resolved(),
+                max_run_s=3600.0)
+            if rres.status != 0 or resolved():
+                return
+            shadow_path = units_dir / f"shadow_unit_{seq:05d}.mkv"
+            try:
+                res = cloud_exec.download_unit(
+                    slot.endpoint, cfg.ssh_key, local_out=shadow_path, unit=unit,
+                    log_path=log,
+                    should_abort=lambda: hard_stop() is not None or resolved())
+                if res.status != 0:
+                    return
+                actual = _probe_frame_count(settings, shadow_path)
+                local_unit = unit
+                if actual != unit["new"]:
+                    shortfall = unit["new"] - actual
+                    if not (seq == tail_seq and 0 < shortfall <= 50):
+                        return  # silently discard; the primary decides the unit
+                    local_unit = {**unit, "new": actual}
+                if not _settle(unit):
+                    return  # the primary resolved it first
+                upath = units_dir / f"unit_{seq:05d}.mkv"
+                os.replace(shadow_path, upath)
+                if local_unit is not unit:
+                    _set_frames_total(settings, job["id"], unit["start"] + actual)
+                _record_chunk(settings, job["id"], local_unit, upath, "valid",
+                              frame_count=actual, checksum=_file_sha256(upath))
+                with state_lock:
+                    completed.add(seq)
+                    completion_log.append((time.monotonic(), actual))
+                spath.unlink(missing_ok=True)
+                slice_budget.release()
+                slot.created_at = time.monotonic()
+                print(f"[dispatch] standby shadow won unit {seq} "
+                      f"(straggler duplicated)", flush=True)
+                done = _units_frames_done(settings, job["id"])
+                if done is not None:
+                    _unit_progress(settings, job, done, run_started, frames_at_start,
+                                   parallelism=max(1, fleet.ready),
+                                   fps_recent=_recent_fps())
+            except Exception:
+                pass  # a shadow may never harm the run
+            finally:
+                shadow_path.unlink(missing_ok=True)
+
         def pod_runner(idx: int) -> None:
             """Own one pod for its whole life. A pod that fails or times out a
             unit is suspect: its units go back to the queue for other pods and
@@ -1660,6 +1737,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
                     pod_bad.set()
 
             finalizers: list[_threading.Thread] = []
+            shadowed: set[int] = set()  # units this pod already raced as standby
             try:
                 current = None
                 while True:
@@ -1686,6 +1764,20 @@ def _run_units_cloud(settings: Settings, job) -> int:
                                 while (not queue_has_work() and not drained()
                                        and stop_reason() is None and not fleet.capped
                                        and not pod_bad.is_set()):
+                                    # Straggler duplication: when exactly ONE
+                                    # unit remains in flight, race it here
+                                    # instead of idling (once per unit — a
+                                    # shadow that lost or failed must not spin).
+                                    shadow = None
+                                    with state_lock:
+                                        if not queue and len(open_units) == 1:
+                                            cand = next(iter(open_units.values()))
+                                            if cand["seq"] not in shadowed:
+                                                shadow = dict(cand)
+                                    if shadow is not None:
+                                        shadowed.add(shadow["seq"])
+                                        run_shadow_unit(slot, shadow)
+                                        continue
                                     time.sleep(2.0)
                             finally:
                                 standby.release()

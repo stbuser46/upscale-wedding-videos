@@ -104,6 +104,13 @@ class CloudFleet:
         self._inter_seed: tuple[str, int] | None = None
         self._inter_thread: threading.Thread | None = None
         self._inter_attempts = 0
+        self._inter_path: Path | None = None
+        # Staging-first (2026-09-25 throughput review): pods that passed the
+        # ingress gate and finished their home-bandwidth provisioning steps
+        # (tree + warm cache) but are still in the ~15-25 min apt/pip/weights
+        # phase. They are valid early targets for the stage-1 intermediate —
+        # that window uses the POD's downlink, leaving the home upstream idle.
+        self._staging_candidates: list[tuple[str, int]] = []
         self._ready = 0
         self._requested = 0
         self._capped = False                       # spend cap tripped -> fleet torn down
@@ -375,6 +382,7 @@ class CloudFleet:
         with self._lock:
             self._slots.pop(slot.pod_id, None)
             self._ready = max(0, self._ready - 1)
+        self._drop_staging_candidate(slot.endpoint)
         self._terminate(slot.pod_id, slot.name, ledger_id=slot.ledger_id)
         self.log(f"[fleet] retired idle pod {slot.pod_id} (no more units)")
 
@@ -672,13 +680,34 @@ class CloudFleet:
         with self._lock:
             return [s.endpoint for s in self._slots.values()]
 
-    def start_intermediate_staging(self, local_path: Path) -> None:
-        """Begin uploading the stage-1 intermediate ONCE to the live pod with the
-        best measured home ingress, in the background. Idempotent; restaged
-        automatically (bounded) if the seed pod later dies. Until a seed exists
-        the dispatcher simply falls back to per-unit home uploads, so this can
-        never make a run slower than the old path."""
+    def _register_staging_candidate(self, endpoint: tuple[str, int]) -> None:
+        """A gate-passed pod entered its long apt/pip/weights phase: it can
+        take the intermediate NOW, while the home upstream is otherwise idle.
+        Eagerly (re)kick staging — slice deliveries (the lazy trigger) don't
+        start until a pod is READY, which is exactly too late."""
         with self._inter_lock:
+            if endpoint not in self._staging_candidates:
+                self._staging_candidates.append(endpoint)
+            path = self._inter_path if self._inter_seed is None else None
+        if path is not None:
+            self.start_intermediate_staging(path)
+
+    def _drop_staging_candidate(self, endpoint: tuple[str, int]) -> None:
+        with self._inter_lock:
+            try:
+                self._staging_candidates.remove(endpoint)
+            except ValueError:
+                pass
+
+    def start_intermediate_staging(self, local_path: Path) -> None:
+        """Begin uploading the stage-1 intermediate ONCE to the gate-passed pod
+        with the best measured home ingress — preferably while the fleet is
+        still provisioning (staging-first), in the background. Idempotent;
+        restaged automatically (bounded) if the seed pod later dies. Until a
+        seed exists the dispatcher simply falls back to per-unit home uploads,
+        so this can never make a run slower than the old path."""
+        with self._inter_lock:
+            self._inter_path = Path(local_path)
             if self._inter_seed is not None or self._inter_attempts >= 3:
                 return
             if self._inter_thread is not None and self._inter_thread.is_alive():
@@ -690,28 +719,43 @@ class CloudFleet:
 
     def _stage_intermediate(self, local_path: Path) -> None:
         live = self._live_endpoints()
-        if not live or self._stop.is_set():
-            # No pod is up yet (e.g. staging requested at dispatch start while
-            # the fleet is still provisioning): not an attempt — the next
-            # intermediate_seed() call relaunches this thread.
+        with self._inter_lock:
+            cands = [c for c in self._staging_candidates if c not in live]
+        pool = live + cands
+        if not pool or self._stop.is_set():
+            # No pod is even provisioning yet (e.g. staging requested at
+            # dispatch start before any create landed): not an attempt — the
+            # next candidate registration or intermediate_seed() call
+            # relaunches this thread.
             return
         with self._inter_lock:
             self._inter_attempts += 1
-        # Prefer the pod that took the cache tarball fastest from home.
-        live.sort(key=lambda e: (self._ingress_hint.get(e) is None,
+        # Prefer the best measured home ingress (the tree upload seeds a hint
+        # for every pod); READY pods and provisioning candidates compete on
+        # equal terms — the transfer outlives provisioning either way.
+        pool.sort(key=lambda e: (self._ingress_hint.get(e) is None,
                                  self._ingress_hint.get(e, 0.0)))
-        target = live[0]
+        target = pool[0]
         size_gb = local_path.stat().st_size / 1e9 if local_path.is_file() else 0.0
+        with self._lock:
+            ready = self._ready
+        # Staging-first: while NO pod is READY nothing competes for the home
+        # upstream (provisioning uses the pods' own downlinks), so run at full
+        # rate — the upload usually completes inside the provisioning window.
+        # Once ready pods may be waiting on first-wave slice uploads, keep the
+        # historical cap so staging never starves them (the observed ~15-min
+        # GPU-idle ramp of 2026-09-24).
+        cap_kbps = 3000 if ready > 0 else None
         self.log(f"[fleet] staging stage-1 intermediate ({size_gb:.1f} GB) on {target[0]} "
-                 f"(one-time upload; slices will be cut there and passed pod-to-pod)")
+                 f"({'full-rate during the provisioning window' if cap_kbps is None else 'rate-capped'}; "
+                 f"slices will be cut there and passed pod-to-pod)")
         t0 = time.monotonic()
         try:
-            # Rate-capped so this multi-GB background upload never starves the
-            # first-wave slice uploads that pods are actively waiting on (the
-            # observed ~15-min GPU-idle ramp of 2026-09-24).
             rsync(target, local_path, REMOTE_INTERMEDIATE, upload=True,
-                  ssh_key=self.cfg.ssh_key, timeout=7200, bwlimit_kbps=3000)
+                  ssh_key=self.cfg.ssh_key, timeout=7200, bwlimit_kbps=cap_kbps)
         except Exception as exc:
+            # A dead/refused target must not be re-picked on the bounded retry.
+            self._drop_staging_candidate(target)
             self.log(f"[fleet] WARN intermediate staging failed ({str(exc)[:100]}); "
                      f"units continue via home uploads")
             return
@@ -728,7 +772,9 @@ class CloudFleet:
         if seed is None:
             self.start_intermediate_staging(local_path)
             return None
-        if seed not in self._live_endpoints():
+        with self._inter_lock:
+            still_provisioning = seed in self._staging_candidates
+        if seed not in self._live_endpoints() and not still_provisioning:
             with self._inter_lock:
                 if self._inter_seed == seed:
                     self._inter_seed = None
@@ -839,26 +885,37 @@ class CloudFleet:
         self._enable_peer_access(endpoint)
         self._ensure_cache_on_pod(endpoint, index, step)
 
-        # Stream provisioning (apt/pip/7.3 GB weights) to a per-pod log rather
-        # than buffering it, and enforce a hard timeout so a stuck pod fails
-        # loudly instead of silently holding a slot.
-        t = time.monotonic()
-        with plog.open("w", encoding="utf-8") as f:
-            proc = subprocess.Popen(
-                ssh_command(endpoint, ["bash", "/workspace/provision/provision_pod.sh"], cfg.ssh_key),
-                stdout=f, stderr=subprocess.STDOUT, text=True,
-            )
-            while proc.poll() is None:
-                if time.monotonic() - t > 1800:
-                    proc.kill()
-                    raise RunpodError(f"provisioning timed out after 30 min (see {plog})")
-                if self._stop.is_set() or self._no_more_work.is_set():
-                    proc.kill()
-                    raise RunpodError("provisioning aborted (fleet stopping or no work remains)")
-                time.sleep(5)
-        tail = plog.read_text(encoding="utf-8", errors="replace")[-600:]
-        if proc.returncode != 0 or "POD READY" not in tail:
-            raise RunpodError(f"provisioning failed (status {proc.returncode}); tail: {tail[-300:]}")
+        # Staging-first: from here the pod spends ~15-25 min on apt/pip/weights
+        # over ITS OWN downlink — the home upstream is free, so offer this pod
+        # as an early intermediate target instead of waiting for READY.
+        self._register_staging_candidate(endpoint)
+        try:
+            # Stream provisioning (apt/pip/7.3 GB weights) to a per-pod log rather
+            # than buffering it, and enforce a hard timeout so a stuck pod fails
+            # loudly instead of silently holding a slot.
+            t = time.monotonic()
+            with plog.open("w", encoding="utf-8") as f:
+                proc = subprocess.Popen(
+                    ssh_command(endpoint, ["bash", "/workspace/provision/provision_pod.sh"], cfg.ssh_key),
+                    stdout=f, stderr=subprocess.STDOUT, text=True,
+                )
+                while proc.poll() is None:
+                    if time.monotonic() - t > 1800:
+                        proc.kill()
+                        raise RunpodError(f"provisioning timed out after 30 min (see {plog})")
+                    if self._stop.is_set() or self._no_more_work.is_set():
+                        proc.kill()
+                        raise RunpodError("provisioning aborted (fleet stopping or no work remains)")
+                    time.sleep(5)
+            tail = plog.read_text(encoding="utf-8", errors="replace")[-600:]
+            if proc.returncode != 0 or "POD READY" not in tail:
+                raise RunpodError(f"provisioning failed (status {proc.returncode}); tail: {tail[-300:]}")
+        except BaseException:
+            # This pod will be terminated by the bring-up retry loop: it must
+            # not linger as a staging target (a mid-flight staging rsync to it
+            # fails on its own and burns one bounded retry).
+            self._drop_staging_candidate(endpoint)
+            raise
         self.log(f"[fleet] pod {index} provisioned ({time.monotonic() - t:.0f}s)")
 
     # -------------------------------------------------------------- teardown
