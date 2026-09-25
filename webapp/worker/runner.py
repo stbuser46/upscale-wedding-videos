@@ -1609,13 +1609,20 @@ def _run_units_cloud(settings: Settings, job) -> int:
             except Exception as exc:  # never lose a unit to a validator crash
                 unit_failed(unit, f"validation failed: {exc}")
 
-        def deliver_slice(slot, unit):
+        def deliver_slice(slot, unit, should_abort=None):
             """Get a unit's slice onto the pod. Preferred: cut it on the seed
             pod holding the stage-1 intermediate and copy it pod-to-pod, PROVEN
             decoded-identical to the local cut via its framemd5 digest — the
             multi-GB intermediate then crosses the home link once per job
-            instead of once per unit. Fallback: today's home upload."""
+            instead of once per unit. Fallback: today's home upload.
+
+            `should_abort` overrides the default worker-stop check — the
+            shadow path passes a resolved-aware one, because a shadow upload
+            that outlives its unit must die with it: a hung rsync here once
+            held the Seg04 standby (and its billing pod) hostage for an hour
+            after every unit had already validated (2026-09-25)."""
             seq = unit["seq"]
+            abort = should_abort or (lambda: hard_stop() is not None)
             digest = slice_hashes.get(seq)
             if digest is not None and fleet.intermediate_seed(stage1) is not None:
                 ss = f"{unit['skip'] / _output_fps(snapshot):.6f}"
@@ -1626,7 +1633,7 @@ def _run_units_cloud(settings: Settings, job) -> int:
                 slot.endpoint, cfg.ssh_key,
                 slice_path=slices_dir / f"unit_{seq:05d}.mkv",
                 unit=unit, log_path=log,
-                should_abort=lambda: hard_stop() is not None)
+                should_abort=abort)
 
         def run_shadow_unit(slot, unit) -> None:
             """Straggler duplication (2026-09-25 throughput review): the
@@ -1652,7 +1659,8 @@ def _run_units_cloud(settings: Settings, job) -> int:
             spath = slices_dir / f"unit_{seq:05d}.mkv"
             if not spath.is_file():
                 return  # slice already cleaned up; nothing safe to duplicate
-            up = deliver_slice(slot, unit)
+            up = deliver_slice(slot, unit,
+                               should_abort=lambda: hard_stop() is not None or resolved())
             if up.status != 0 or resolved():
                 return
             rres = cloud_exec.restore_unit(
