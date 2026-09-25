@@ -196,14 +196,22 @@ instead of billing them through transfers:
   frames → strict frame-count validation failed on otherwise-perfect footage).
   `apad` pads audio so `-shortest` can only ever trim audio down to the video —
   video frames are never lost. Verified on Segment 16's real units: 34331 → 34340.
-- **Warm-worker engine (`docker/seedvr2-pod/pod_engine.py`, GATED OFF):** a
-  resident per-pod SeedVR2 service to skip the ~2-4 min per-unit model reload.
-  Built, Codex-reviewed, 46-test covered, and taken to a PAID identity canary:
-  the mechanics work (one resident process, DiT+VAE reuse, request #2 ~37%
-  faster) but decoded output DIFFERS from the one-shot path (cache-mode code
-  branches), so `WEDDING_POD_ENGINE` stays OFF pending a parameter-alignment fix
-  and a re-canary. The cloud one-shot path was proven bit-DETERMINISTIC, so
-  bit-identity remains the acceptance bar. See `needs fixing.md`.
+- **Warm-worker engine (`docker/seedvr2-pod/pod_engine.py`, PRODUCTION on RTX
+  PRO 6000 Blackwell SE):** a resident per-pod SeedVR2 service that skips the
+  ~2-4 min per-unit model reload. The first paid canary FAILED on decoded-hash
+  identity; the root cause (upstream flips the default offload "none" to CPU
+  when caching is enabled — a memory lifecycle the one-shot path never runs)
+  was found by dual review on 2026-09-25 and fixed by pinning the engine's
+  offload target to the compute GPU itself (same-device no-op moves; commit
+  be1a765). The re-canary then PASSED both the small-cap diagnostic and the
+  formal full-size acceptance (decoded-frame hashes identical one-shot vs
+  engine on both production shapes, persistent-pid proof, 27% faster full-size
+  request), and `WEDDING_POD_ENGINE=1` restored Gulfraz disc-2 Segs 03-06 in
+  production at ~2.1-2.7 min/unit fleet-wide. A PASS binds one GPU class —
+  re-canary before renting any other type. Known flake: ~1% of engine units go
+  silent >900 s ("wedged"); the stall detector kills via the verified barrier
+  and re-runs the SAME unit through the classic one-shot on that pod, so no
+  attempt is burned and identity is unaffected. See `needs fixing.md`.
 - **No unowned billing:** when the unit queue drains, runners call
   `fleet.mark_no_more_work()` — unclaimed pods in the slot queue are retired
   immediately, a pod that goes READY later is retired on arrival, and pending

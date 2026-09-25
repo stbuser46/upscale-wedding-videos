@@ -1,5 +1,32 @@
 # Needs fixing
 
+## Open items after the Gulfraz disc-2 run (2026-09-25, evening)
+
+- **Engine wedge flake (~1%):** twice in ~190 engine-mode units the resident
+  engine went silent >900 s on a unit ("engine silent for 900s (wedged)") —
+  both times on hosts whose classic one-shot fallback then ALSO failed, i.e.
+  lemon hosts rather than engine bugs. The guards worked end-to-end (stall
+  detect → verified kill barrier → fallback → condemn → auto-replacement),
+  each costing ~15 min of single-pod wall. Watch the rate; if it climbs,
+  instrument the engine's stdout heartbeat before suspecting the model path.
+- **Tail restage waste:** when the staging-seed pod retires/dies in a
+  segment's TAIL, a late slice request triggers a pointless multi-GB restage
+  for 1-2 remaining units (observed twice; self-limiting — the target retires
+  too and the rsync dies). Guard: skip restaging when
+  `len(queue)+len(open_units)` is small or all remaining units already have
+  local slices.
+- **apad duration luck (FIXED in both mux paths):** `apad` + `-shortest`
+  let the audio stream overshoot video by up to ~1.5 FLAC blocks; every
+  segment before Gulfraz DVD2 Seg06 passed the 0.12 s validator by luck,
+  Seg06 failed by 8 ms (corrupt end-of-disc audio packets shifted timestamps).
+  Fixed with `apad=whole_dur=$DUR` in BOTH `assemble_units.sh` (the durable
+  path that actually runs for cloud jobs) and `pipeline_v3.sh` stage 4;
+  Seg06 then validated at 23 ms delta. Gotcha recorded: the two files carry
+  twin mux commands — change both or neither.
+- **Monitor STATE lines omit the error column** (operator tooling note):
+  the session's heartbeat monitor printed `failed (error=None)` because its
+  SELECT skipped `error` — include it next time.
+
 ## Codex round-4 pre-commit review (2026-09-25) — triage
 
 **Fixed before commit:**

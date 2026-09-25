@@ -376,7 +376,7 @@ if [[ ! -s "$OUTPUT" ]]; then
     -i "/proj/${RESTORED#"$PROJ/"}" \
     -ss "$AUDIO_SEEK" -t "$AUDIO_READ" -i "/proj/${INPUT#"$PROJ/"}" \
     -map 0:v:0 -map 1:a:0 -c:v copy \
-    -af "atrim=start=$AUDIO_TRIM:duration=$DUR,asetpts=N/SR/TB,apad" \
+    -af "atrim=start=$AUDIO_TRIM:duration=$DUR,asetpts=N/SR/TB,apad=whole_dur=$DUR" \
     -c:a flac -sample_fmt s16 -compression_level 8 -shortest \
     -metadata title="Wedding DVD restoration — SeedVR2 50p" \
     "/proj/${OUTPUT_PART#"$PROJ/"}"
