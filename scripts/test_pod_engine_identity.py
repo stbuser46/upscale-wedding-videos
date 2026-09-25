@@ -124,6 +124,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-run-s", type=float, default=3600.0)
     ap.add_argument("--workdir", type=Path, default=Path("/tmp/pod-engine-canary"),
                     help="local dir for pulled outputs + the run log")
+    ap.add_argument("--engine-env", action="append", default=[], metavar="KEY=VAL",
+                    help="engine-only env var (repeatable) for canary-ladder "
+                         "variants, e.g. ENGINE_MIRROR=1 (one-shot mirror "
+                         "control) or ENGINE_DIT_OFFLOAD=cpu (legacy offload "
+                         "reproduction). Production engines get none of these.")
     return ap.parse_args()
 
 
@@ -177,7 +182,10 @@ def main() -> int:
     # (c)+(d) resident engine — ONE process serves both requests; request #2
     # changes shape AND content on top of the resident state, which is the
     # exact case the whole feature must not corrupt.
-    engine = PodEngine(pod_engine_command(endpoint, args.key),
+    engine_env = dict(kv.split("=", 1) for kv in args.engine_env)
+    if engine_env:
+        print(f"[canary] engine-only env: {engine_env}")
+    engine = PodEngine(pod_engine_command(endpoint, args.key, env=engine_env or None),
                        name=f"{args.host}:{args.port}",
                        remote_killer=pod_engine_remote_killer(endpoint, args.key))
     try:

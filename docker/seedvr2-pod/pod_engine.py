@@ -80,18 +80,33 @@ def _device_list(args) -> list[str]:
 
 def handle(argv: list[str]) -> int:
     args = _parse(argv)
-    # ENGINE-ONLY residency (Codex round-3 finding #8): the pinned argv carries
-    # --cache_vae but not --cache_dit, so without this the DiT would be deleted
-    # and rematerialized every request — most of the reload the engine exists
-    # to avoid. Forcing cache_dit here keeps the DiT resident (offloaded to CPU
-    # between requests) exactly as upstream's directory mode does. The classic
-    # one-shot path is untouched: it forces runner_cache=None, which makes both
-    # cache flags ineffective. Safety: the historical VRAM leak was
-    # compile_dit-specific — cache_dit WITHOUT compile holds the eager model
-    # resident — and output identity with the one-shot path is proven by the
-    # paid identity canary (scripts/test_pod_engine_identity.py) before the
-    # WEDDING_POD_ENGINE gate may be enabled.
-    args.cache_dit = True
+    # ENGINE_MIRROR=1 (canary-ladder control only): run this request exactly as
+    # a one-shot would — no persistent cache, no cache_dit forcing, no offload
+    # pinning — so the harness itself can be validated against the one-shot
+    # hash before any resident-mode variant is judged.
+    mirror = os.environ.get("ENGINE_MIRROR") == "1"
+    if not mirror:
+        # ENGINE-ONLY residency (Codex round-3 finding #8): the pinned argv
+        # carries --cache_vae but not --cache_dit, so without this the DiT
+        # would be deleted and rematerialized every request — most of the
+        # reload the engine exists to avoid. The classic one-shot path is
+        # untouched: it forces runner_cache=None, which makes both cache flags
+        # ineffective.
+        args.cache_dit = True
+        # Identity alignment (2026-09-25 canary FAIL root cause): with caching
+        # enabled, upstream flips the default offload "none" to CPU
+        # (_parse_offload_device's cache_enabled branch), so the engine ran a
+        # CPU-offload memory lifecycle the one-shot path never executes — and
+        # its output diverged on the very FIRST request. Pin the offload
+        # target to the compute GPU itself: the "offload" moves become
+        # same-device no-ops, weights stay resident (the 95 GB card holds
+        # model + 35 GB peak with headroom), and the effective phase branches
+        # match one-shot. Env-overridable for the canary ladder only; the
+        # shared pinned argv (lib/seedvr2_unit_args.sh) is never touched.
+        if args.dit_offload_device == "none":
+            args.dit_offload_device = os.environ.get("ENGINE_DIT_OFFLOAD", "0")
+        if args.vae_offload_device == "none":
+            args.vae_offload_device = os.environ.get("ENGINE_VAE_OFFLOAD", "0")
     cli.debug.enabled = args.debug
     err = _validate(args)
     if err:
@@ -109,8 +124,9 @@ def handle(argv: list[str]) -> int:
         args.output_format = "mp4" if input_type == "video" else "png"
 
     # THE deliberate difference from one-shot main(): a persistent cache so the
-    # model context survives between requests. Single-GPU only.
-    runner_cache = RUNNER_CACHE if len(device_list) == 1 else None
+    # model context survives between requests. Single-GPU only. In mirror mode
+    # the cache is withheld so upstream takes the exact one-shot branches.
+    runner_cache = RUNNER_CACHE if (len(device_list) == 1 and not mirror) else None
 
     frames = cli.process_single_file(args.input, args, device_list, args.output,
                                      format_auto_detected=format_auto_detected,

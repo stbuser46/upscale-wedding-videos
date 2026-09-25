@@ -203,7 +203,8 @@ def restore_unit(
     return UnitResult(status=0, restore_s=t_run)
 
 
-def pod_engine_command(endpoint: tuple[str, int], ssh_key: Path) -> list[str]:
+def pod_engine_command(endpoint: tuple[str, int], ssh_key: Path,
+                       env: dict[str, str] | None = None) -> list[str]:
     """The argv that spawns a pod's resident engine over one persistent ssh
     session. Isolated so tests can hand PodEngine a local fake instead.
 
@@ -219,7 +220,13 @@ def pod_engine_command(endpoint: tuple[str, int], ssh_key: Path) -> list[str]:
     # 2026-09-25: "ENGINE READY" followed immediately by "ENGINE EXITING").
     # With --wait, setsid stays in the foreground as the session leader's
     # parent, keeping ssh's stdin/stdout wired to the engine.
-    return ssh_command(endpoint, ["setsid", "--wait", "python", POD_ENGINE_PATH], ssh_key)
+    # `env` sets engine-only variables (canary-ladder variants such as
+    # ENGINE_MIRROR / ENGINE_DIT_OFFLOAD); production callers pass none.
+    argv = ["setsid", "--wait"]
+    if env:
+        argv += ["env"] + [f"{k}={v}" for k, v in sorted(env.items())]
+    argv += ["python", POD_ENGINE_PATH]
+    return ssh_command(endpoint, argv, ssh_key)
 
 
 def pod_engine_remote_killer(endpoint: tuple[str, int], ssh_key: Path) -> Callable[[int], bool]:
