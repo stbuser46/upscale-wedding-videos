@@ -1,5 +1,12 @@
 # Remaining family recordings — source inventory & restoration plan
 
+> **Update 2026-09-29:** Gulfraz And Fahiza is now fully restored (both discs)
+> and delivered to the NAS. Mo and anisha is ready to run with no code changes.
+> The step-by-step plan, cost and ETA are in
+> [`MO_ANISHA_RUNBOOK.md`](MO_ANISHA_RUNBOOK.md). The TFF handling described
+> below is already configured for this disc. Only the two VHS events remain
+> after Mo.
+
 _Status as of 2026-09-16. The **Yacoob & Aysha** wedding (2 DVDs, 22 chapters) is
 already fully restored and delivered. This document covers the **four events that
 remain**, all staged on `nas.home:/volume1/Movies/WeddingFilm/`._

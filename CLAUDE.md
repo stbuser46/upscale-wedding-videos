@@ -40,7 +40,7 @@ The v3 pipeline preserves both bottom-field-first PAL motion samples as 50p, cre
 - **Yacoob & Aysha**: all 22 chapters were done on the local RTX PRO 6000 and are in `nas.home:/volume1/Movies/WeddingFilm/Yacoob And Aysha/`.
 - **Gulfraz & Fahiza** (NTSC, finished 2026-09-25): DVD 1 has 16 segments and DVD 2 has 6. DVD 2 was restored on the cloud fleet. The files are in `.../Gulfraz And Fahiza/Upscaled/DVD 1/` and `/DVD 2/`.
 
-Still unrestored: the Mo & Anisha PAL-TFF DVD and the two VHS events. The Mo disc is already investigated and needs no code changes; see `webapp/data/MO_DISC_INVESTIGATION_2026-09-25.md`.
+Still unrestored: the Mo & Anisha PAL-TFF DVD and the two VHS events. The Mo disc is already investigated and needs no code changes; the step-by-step plan with cost and ETA is `docs/MO_ANISHA_RUNBOOK.md`.
 
 **Cloud fan-out** — `webapp/cloud/` runs durable restoration units on rented RunPod GPUs: a stdlib-only control-plane client, a concurrent pod fleet (`fleet.py`) with a spend cap and guaranteed teardown, a remote unit executor (`executor.py`), a chapter slicer, a money-safety reaper, a pod image under `docker/seedvr2-pod/`, and a `cloud_pods` spend ledger surfaced by a read-only "Cloud fleet" UI panel. `lib/seedvr2_unit_args.sh` gives the local and cloud paths one shared argv so they can never drift. The worker selects local vs cloud **per process** via `WEDDING_EXECUTOR` (default `local`) — there is no per-job cloud toggle in the GUI. A standalone CLI (`python -m webapp.cloud.cli`) can also drive a single pod for testing. Dispatch is **pipelined per pod** (upload/restore/download overlap, background pre-slicer, in-run retry with settle-once semantics, automatic pod replacement, operator hot-add via `<work>/add_pods`) with peer-to-peer transfer paths so bulk data crosses the home upstream once per job (warm-cache seeding; stage-1 intermediate staged on the best-ingress pod with per-slice framemd5 identity proofs; sibling-relay downloads), an ingress gate that refuses slow-route hosts before provisioning, and money accounting hardened through two adversarial review rounds plus three days of live incidents (per-attempt ledger rows, fail-closed spend watchdog, kills-first teardown) — all mock-tested (`webapp/worker/test_cloud_dispatch.py`, `webapp/cloud/test_fleet_cache.py`, `webapp/cloud/test_pod_engine.py`, 51 tests) and live-proven across multiple paid fleets 2026-09-23/25. See `docs/ARCHITECTURE.md` ("Pipelined dispatch" + "Hardening round 2" + money-safety sections).
 
@@ -51,7 +51,7 @@ The 2026-09-25 throughput upgrades are opt-in env flags on the cloud worker:
 - **Cross-segment keep-alive** (`WEDDING_CLOUD_KEEP_ALIVE=1`): healthy tail pods are parked and handed to the next queued job. Parking is proven live; handing a parked pod to the next job has not yet run live.
 - **Pre-baked public pod image** (`WEDDING_CLOUD_IMAGE=ghcr.io/stbuser46/seedvr2-pod:v3`): not yet tried in a live fleet.
 
-Rationale and remaining ideas are in `webapp/data/THROUGHPUT_REVIEW_2026-09-25.md` and `needs fixing.md`.
+Rationale and remaining ideas are in `docs/THROUGHPUT_REVIEW_2026-09-25.md` and `needs fixing.md`.
 
 **VHS pilot** — `pipeline_vhs.sh` (+ `scripts/vhs_preview.sh`) targets the two remaining VHS events (Nosheen wedding, Sheerjeel birthday), which are already-progressive 1080p cassette transfers, not DVDs. The front-end is validated and 20 s Sheerjeel Original+Copy previews are restored and reviewed. The webapp gained a **Previews** tab (`/previews`, data-driven from `webapp/data/previews/manifest.json`, media served with HTTP Range) that plays the before/after clips. Full-file runs are pending source (Original vs Copy) and frame-rate (25p vs 50p) selection. See `docs/VHS_PIPELINE.md` and `docs/REMAINING_SOURCES.md`.
 
@@ -66,3 +66,5 @@ Cancellation is honored only between major pipeline stages and durable units; in
 - [`docs/PERF_REVIEW_2026-09-21.md`](docs/PERF_REVIEW_2026-09-21.md) — Performance review: measured time breakdown, local (~1.15–1.3x) and cloud recommendations
 - [`docs/VHS_PIPELINE.md`](docs/VHS_PIPELINE.md) — VHS-transfer restoration recipe, source specs, and previews page
 - [`docs/REMAINING_SOURCES.md`](docs/REMAINING_SOURCES.md) — Inventory & plan for the remaining DVD + VHS sources
+- [`docs/MO_ANISHA_RUNBOOK.md`](docs/MO_ANISHA_RUNBOOK.md) — How to restore the Mo & Anisha DVD, with cost and ETA (`scripts/queue_segments.py` queues the segments)
+- [`docs/THROUGHPUT_REVIEW_2026-09-25.md`](docs/THROUGHPUT_REVIEW_2026-09-25.md) — Cloud GPU-saturation review behind the warm engine and staging-first
