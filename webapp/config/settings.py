@@ -33,11 +33,14 @@ class DiscSpec:
 # Allow-list of source discs. Adding a wedding = add its ISO(s) here and drop the
 # file(s) in source/. Field order verified with idet; PAL DVDs are usually bff,
 # NTSC usually bff too, but Mo's disc probes as tff — never assume.
+#
+# Finished weddings are REMOVED from this list once delivered to the NAS, so
+# the catalog only shows work still to do. Restored so far (ISOs kept in
+# source/, outputs on nas.home:/volume1/Movies/WeddingFilm/):
+#   Yacoob And Aysha   weddind_dvd_1.ISO (dvd1), weddind_dvd_2.ISO (dvd2)  pal/bff
+#   Gulfraz And Fahiza gulfraz_dvd1.iso (gulfraz1), gulfraz_dvd2.iso (gulfraz2)  ntsc/bff
+# To restore one again, re-add its DiscSpec line and rescan.
 DISC_REGISTRY: tuple[DiscSpec, ...] = (
-    DiscSpec("weddind_dvd_1.ISO", "dvd1", "Yacoob And Aysha", "pal", "bff"),
-    DiscSpec("weddind_dvd_2.ISO", "dvd2", "Yacoob And Aysha", "pal", "bff"),
-    DiscSpec("gulfraz_dvd1.iso", "gulfraz1", "Gulfraz And Fahiza", "ntsc", "bff"),
-    DiscSpec("gulfraz_dvd2.iso", "gulfraz2", "Gulfraz And Fahiza", "ntsc", "bff"),
     DiscSpec("mo_dvd1.iso", "mo1", "Mo and anisha", "pal", "tff"),
 )
 

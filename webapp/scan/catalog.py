@@ -593,7 +593,7 @@ def main(argv: list[str] | None = None) -> None:
         "--restored-proxies", action="store_true",
         help="generate browser proxies of completed chapter restorations",
     )
-    parser.add_argument("--disc", help="limit proxy generation to one disc slug (e.g. gulfraz1)")
+    parser.add_argument("--disc", help="limit proxy generation to one disc slug (e.g. mo1)")
     parser.add_argument("--limit", type=int, help="limit proxy count for a verification run")
     parser.add_argument("--force", action="store_true", help="regenerate existing review media")
     args = parser.parse_args(argv)
