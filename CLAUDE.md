@@ -25,7 +25,6 @@ This project preserves and restores old home DVDs — weddings, birthdays, and o
 | `scripts/` | Pipeline acceptance tests (e.g. the slice/unit equivalence proof) and `vhs_preview.sh` (VHS before/after bake-off) |
 | `models/` | Downloaded AI model weights (gitignored) |
 | `docs/` | Pipeline settings, UI specification, and architecture |
-| `work/`, `out/` | Legacy pipeline test runs and reference outputs (not managed by webapp) |
 
 ## Current status
 
